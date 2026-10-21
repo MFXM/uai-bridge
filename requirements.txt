@@ -1,0 +1,5 @@
+# Runtime dependencies (versions tested with uai_bridge on Python 3.12)
+fastapi==0.156.4
+uvicorn==0.54.0
+httpx==0.28.1
+python-multipart==0.0.32
