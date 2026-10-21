@@ -8,7 +8,7 @@ services:
     # build: .
     # Option B: prebuilt multi-arch image (amd64/arm64); ":1" = newest 1.x release.
     # With "build: ." enabled, this name is only used as the tag of your local build.
-    image: ghcr.io/<your-handle>/uai-bridge:1
+    image: ghcr.io/MFXM/uai-bridge:1
     container_name: uai-bridge
     restart: unless-stopped
     env_file: .env

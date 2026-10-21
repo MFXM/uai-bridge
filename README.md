@@ -81,7 +81,7 @@ The bridge holds your u:ai secret, so building it yourself is the safer choice. 
 
 ### Option A: build from source (recommended)
 ```bash
-git clone https://github.com/<your-handle>/uai-bridge.git
+git clone https://github.com/MFXM/uai-bridge.git
 cd uai-bridge
 cp .env.example .env
 cp compose.example.yml compose.yml
@@ -107,12 +107,12 @@ Update: `git pull && docker compose up -d --build`.
 
 ### Option B: prebuilt image (quickest)
 Every release is published as a ready-to-run image for amd64 and arm64:
-`ghcr.io/<your-handle>/uai-bridge`. You only need two files, no Git checkout:
+`ghcr.io/MFXM/uai-bridge`. You only need two files, no Git checkout:
 
 ```bash
 mkdir uai-bridge && cd uai-bridge
-curl -fsSL https://raw.githubusercontent.com/<your-handle>/uai-bridge/main/compose.example.yml -o compose.yml
-curl -fsSL https://raw.githubusercontent.com/<your-handle>/uai-bridge/main/.env.example -o .env
+curl -fsSL https://raw.githubusercontent.com/MFXM/uai-bridge/main/compose.example.yml -o compose.yml
+curl -fsSL https://raw.githubusercontent.com/MFXM/uai-bridge/main/.env.example -o .env
 nano .env && chmod 600 .env        # as in option A, steps 1-2
 docker compose up -d
 ```
@@ -135,7 +135,7 @@ curl -s -H "Authorization: Bearer $BRIDGE_KEY" -H "Content-Type: application/jso
 Requirements: Python 3.10 or newer.
 
 ```bash
-git clone https://github.com/<your-handle>/uai-bridge.git && cd uai-bridge
+git clone https://github.com/MFXM/uai-bridge.git && cd uai-bridge
 python3 -m venv .venv && source .venv/bin/activate      # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 cp .env.example .env && nano .env                      # fill in as above
