@@ -107,7 +107,7 @@ Update: `git pull && docker compose up -d --build`.
 
 ### Option B: prebuilt image (quickest)
 Every release is published as a ready-to-run image for amd64 and arm64:
-`ghcr.io/MFXM/uai-bridge`. You only need two files, no Git checkout:
+`ghcr.io/mfxm/uai-bridge`. You only need two files, no Git checkout:
 
 ```bash
 mkdir uai-bridge && cd uai-bridge
@@ -179,7 +179,7 @@ service. Other containers reach it by its service name, so it does not need a pu
      uai-bridge:
        build:
          context: ./services/uai-bridge
-       # or skip building and use the prebuilt image:  image: ghcr.io/MFXM/uai-bridge:1
+       # or skip building and use the prebuilt image:  image: ghcr.io/mfxm/uai-bridge:1
        container_name: uai-bridge
        restart: unless-stopped
        env_file: .env.uai
