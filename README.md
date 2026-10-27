@@ -25,14 +25,15 @@ bases (RAG).
 6. [Connecting clients](#connecting-clients)
 7. [Endpoints](#endpoints)
 8. [Tailored AIs and knowledge bases](#tailored-ais-and-knowledge-bases)
-9. [Configuration reference](#configuration-reference)
-10. [Security](#security)
-11. [Several users](#several-users)
-12. [Limitations of the u:ai API](#limitations-of-the-uai-api)
-13. [Development and tests](#development-and-tests)
-14. [Troubleshooting](#troubleshooting)
-15. [Related projects](#related-projects)
-16. [Acknowledgements](#acknowledgements)
+9. [Monthly usage](#monthly-usage)
+10. [Configuration reference](#configuration-reference)
+11. [Security](#security)
+12. [Several users](#several-users)
+13. [Limitations of the u:ai API](#limitations-of-the-uai-api)
+14. [Development and tests](#development-and-tests)
+15. [Troubleshooting](#troubleshooting)
+16. [Related projects](#related-projects)
+17. [Acknowledgements](#acknowledgements)
 
 ---
 
@@ -44,10 +45,12 @@ bases (RAG).
   Answers include the sources.
 - **Optional knowledge-base management:** create, upload, ingest and link a Tailored AI in one call.
   Uploads only.
+- **Monthly usage counter:** `GET /v1/usage` shows requests, tokens and the estimated cost of the
+  current month, so you can see how much of your allowance is left.
 - **Secure by default:** API key required, binds to `127.0.0.1`, no filesystem access, size limits,
   bounded retries, client-side rate limiting, no prompt logging, non-root read-only container.
-- **One file** (`uai_bridge.py`), four dependencies, tested: 43 unit tests against a mocked API plus a
-  28-check live test against the real u:ai API.
+- **One file** (`uai_bridge.py`), five dependencies, tested: 55 unit tests against a mocked API plus a
+  29-check live test against the real u:ai API.
 
 ## Before you start: u:ai API access
 1. **Request an API account** through the ZID Servicedesk; see
@@ -188,6 +191,7 @@ service. Other containers reach it by its service name, so it does not need a pu
        networks: [backend, internet]   # use your stack's network names
        read_only: true
        tmpfs: [/tmp]
+       volumes: [uai-bridge-data:/data]   # monthly usage counter; declare it under top-level "volumes:"
        cap_drop: [ALL]
        security_opt: ["no-new-privileges:true"]
        mem_limit: 256m
@@ -250,7 +254,8 @@ Tools that support function/tool calling work through the bridge's emulated tool
 | `GET /health` | no | liveness check, returns version |
 | `GET /v1/models` | yes | models available to your API client |
 | `POST /v1/chat/completions` | yes | OpenAI chat (tools, `stream`, `response_format`, …) |
-| `GET /v1/pricing` | yes | price per 1M tokens in USD (u:ai reports USD per 1 000 tokens) |
+| `GET /v1/pricing` | yes | price per 1M tokens in USD (u:ai reports USD per 1 000 tokens), plus the per-request fee where a model has one |
+| `GET /v1/usage`, `GET /v1/usage/history` | yes | requests, tokens and estimated cost per month (see [Monthly usage](#monthly-usage)) |
 | `GET /api/tags`, `POST /api/chat`, `GET /api/version` | yes (`/api/version` no) | Ollama compatibility |
 | `/v1/uai/...` | yes | knowledge bases and Tailored AIs, only with `BRIDGE_ENABLE_KB=true` |
 
@@ -313,6 +318,44 @@ the extra `citations` field.
 Allowed file types: `BRIDGE_UPLOAD_EXTENSIONS` (default
 pdf, doc, docx, txt, md, csv, html, htm, rtf, odt, pptx, xlsx, json).
 
+## Monthly usage
+The bridge counts what goes through it per calendar month: requests, prompt/completion tokens and an
+**estimated** cost in USD. Use it to see how much of your monthly allowance you have already used. The
+allowance itself is not configured in the bridge, because it differs between accounts and can change.
+
+```bash
+curl -s -H "Authorization: Bearer $BRIDGE_KEY" http://127.0.0.1:8000/v1/usage            # this month
+curl -s -H "Authorization: Bearer $BRIDGE_KEY" "http://127.0.0.1:8000/v1/usage?month=2026-09"
+curl -s -H "Authorization: Bearer $BRIDGE_KEY" http://127.0.0.1:8000/v1/usage/history    # one line per month
+```
+Example response (shortened, numbers made up):
+```json
+{"month": "2026-10", "timezone": "UTC", "period_start": "2026-10-01T00:00:00+00:00",
+ "period_end": "2026-11-01T00:00:00+00:00", "currency": "USD",
+ "requests": 412, "prompt_tokens": 903311, "completion_tokens": 120877, "total_tokens": 1024188,
+ "estimated_cost_usd": 3.218804, "requests_without_usage": 7, "requests_without_price": 0,
+ "month_elapsed_fraction": 0.8312, "projected_month_cost_usd": 3.872478, "projected_month_tokens": 1232180,
+ "by_model": {"gpt-5": {"requests": 120, "total_tokens": 610233, "estimated_cost_usd": 2.41, "...": "..."}},
+ "first_request": "...", "last_request": "...", "persistent": true}
+```
+- **Why an estimate:** u:ai replies contain token counts but no cost, and the endpoint that reports an
+  account's spend (`/api/v1/cost`) is restricted to platform administrators.
+- **Cost** = prompt tokens × input price + completion tokens × output price (+ the flat per-request fee of
+  web-search models such as `sonar-pro`), using the u:ai price list (`/v1/pricing`) at the time of each
+  request. Prices are cached for `BRIDGE_MODELS_CACHE_S`.
+- `projected_month_*` extrapolates the month so far linearly to its end (shown from the second day on).
+- **Not counted:** Tailored-AI replies carry no token usage upstream; they appear only as
+  `requests_without_usage`. Knowledge-base ingestion and anything you do *outside* this bridge (other
+  tools, the u:ai web interface) are not seen either. `requests_without_price` counts replies for
+  models without a listed price. Treat the figures as a lower bound, not an official statement.
+- **Months** start and end in `BRIDGE_USAGE_TZ` (default `UTC`, e.g. `Europe/Vienna`).
+- **Storage:** the Docker image keeps the counter in `/data/usage.json`. `compose.example.yml`
+  mounts a named volume there, so it survives updates; `"persistent": false` means the file could
+  not be written and the counter resets on restart. Outside Docker set `BRIDGE_USAGE_FILE` to a path.
+  The file holds only counts, model names and a hash of the u:ai client ID, no prompts or answers.
+- In `passthrough` mode each caller sees only the usage of their own u:ai client.
+- `BRIDGE_USAGE_TRACKING=false` switches the counter and `/v1/usage` off.
+
 ## Configuration reference
 All settings are environment variables; see `.env.example` for a commented template.
 
@@ -343,6 +386,9 @@ All settings are environment variables; see `.env.example` for a commented templ
 | `BRIDGE_ENFORCE_JSON` | `true` | with `response_format: json_object`, instruct the model and extract the JSON from the reply |
 | `BRIDGE_GEMINI_MIN_MAX_TOKENS` | `1024` | lower bound for `max_tokens` on Gemini models (0 = off) |
 | `BRIDGE_COST_UNIT_TOKENS` | `1000` | number of tokens the u:ai `cost` values refer to (for `/v1/pricing`) |
+| `BRIDGE_USAGE_TRACKING` | `true` | monthly usage counter and `/v1/usage` |
+| `BRIDGE_USAGE_FILE` | – (Docker: `/data/usage.json`) | where the counter is stored; unset = in memory only |
+| `BRIDGE_USAGE_TZ` | `UTC` | time zone in which months start (IANA name, e.g. `Europe/Vienna`) |
 | `BRIDGE_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, … |
 
 ## Security
@@ -391,19 +437,21 @@ possible:
   answer e.g. "Here is the JSON: \`\`\`json {…} \`\`\`". The bridge adds an instruction and extracts the JSON
   object (`BRIDGE_ENFORCE_JSON`).
 - **Tailored-AI replies have another shape:** `data.message.content` instead of `data.content`, and
-  no token usage. The bridge handles both shapes; `usage` is reported as 0 for Tailored-AI chats.
+  no token usage. The bridge handles both shapes; `usage` is reported as 0 for Tailored-AI chats
+  (and these chats are missing from the cost estimate of `/v1/usage`).
 - **Web-search models** (`sonar-*`) return website citations; the bridge appends them with their URLs.
 - **Images:** not documented; disabled by default (`BRIDGE_IMAGE_MODE`).
 - **Stateless:** conversation history must be sent with each request (clients do this anyway).
 - **Prices:** the API documentation says "USD per token", but the live values are USD per 1 000 tokens
   (e.g. `gpt-5` = 0.00138, i.e. 1.38 USD per 1M input tokens). `/v1/pricing` converts to per 1M tokens.
+  Web-search models additionally list a `per_request` fee, which is USD per single request.
 - **Error details** are in `meta.error.message` of u:ai's error response; the bridge forwards that text.
 
 ## Development and tests
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
-pytest -q          # 43 tests against a mocked u:ai API, no network or credits needed
+pytest -q          # 55 tests against a mocked u:ai API, no network or credits needed
 ```
 
 **End-to-end check against the real API** (uses a few cents of your credit; creates and deletes a tiny
@@ -419,7 +467,7 @@ streaming, error mapping, Ollama endpoints, Mistral/Gemini/Claude/Sonar models, 
 Tailored AI creation, retrieval with citations, and cleanup.
 The tests cover authentication, the absence of any server-file-path endpoint, message and parameter translation,
 tool-call parsing, error mapping and retry rules, streaming format, citations, pricing, Ollama
-compatibility and the knowledge-base workflow including cleanup.
+compatibility, the knowledge-base workflow including cleanup, and the monthly usage counter.
 
 ## Troubleshooting
 | Symptom | Cause / fix |

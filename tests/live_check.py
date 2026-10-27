@@ -216,6 +216,19 @@ def t_pricing():
     check("pricing per 1M tokens plausible", sane, json.dumps(vals)[:300])
 
 
+def t_usage():
+    r = c.get("/v1/usage", headers=H)
+    if r.status_code == 404:
+        check("monthly usage counter", True, "skipped: BRIDGE_USAGE_TRACKING=false")
+        return
+    u = r.json()
+    # The chats above must have been counted, with tokens and a cost estimate.
+    check("monthly usage counter", r.status_code == 200 and u["requests"] > 0 and u["total_tokens"] > 0
+          and u["estimated_cost_usd"] > 0,
+          f"{u.get('month')}: {u.get('requests')} req, {u.get('total_tokens')} tok, "
+          f"~{u.get('estimated_cost_usd')} USD, persistent={u.get('persistent')}")
+
+
 # ---------------------------------------------------------------- knowledge base (optional)
 def t_kb():
     code = f"ZEBRA-{uuid.uuid4().hex[:6].upper()}"
@@ -251,7 +264,7 @@ def t_kb():
 
 
 tests = [t_health, t_auth, t_models, t_simple, t_system_and_multiturn, t_reasoning_tokens, t_json_mode,
-         t_tools, t_no_tool_needed, t_stream, t_errors, t_ollama, t_other_vendors, t_pricing]
+         t_tools, t_no_tool_needed, t_stream, t_errors, t_ollama, t_other_vendors, t_pricing, t_usage]
 if "--kb" in sys.argv:
     tests.append(t_kb)
 for t in tests:

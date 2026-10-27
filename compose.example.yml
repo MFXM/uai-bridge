@@ -19,9 +19,15 @@ services:
     read_only: true
     tmpfs:
       - /tmp
+    volumes:
+      # Monthly usage counter (GET /v1/usage); without it the counter resets on every update.
+      - uai-bridge-data:/data
     cap_drop:
       - ALL
     security_opt:
       - no-new-privileges:true
     mem_limit: 256m
     pids_limit: 128
+
+volumes:
+  uai-bridge-data:

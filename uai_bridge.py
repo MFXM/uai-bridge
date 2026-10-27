@@ -10,25 +10,31 @@ Security model (summary, see README.md):
     features are opt-in (BRIDGE_ENABLE_KB=true) and only accept uploads.
   * Bounded retries (never on read timeouts, to avoid double billing),
     client-side rate limiting, request/upload size limits, no prompt logging.
+  * Optional monthly usage counter (tokens + estimated USD): stores only counts,
+    model names and a hash of the u:ai client ID - never prompts or answers.
 
 Developed with the help of AI coding assistants (Anthropic Claude Opus, Google Gemini); see README.
 """
 from __future__ import annotations
 
 import asyncio
+import calendar
 import collections
+import hashlib
 import hmac
 import ipaddress
 import json
 import logging
 import os
 import re
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 from fastapi import FastAPI, File, Form, Request, UploadFile
@@ -36,7 +42,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 log = logging.getLogger("uai-bridge")
 
@@ -103,6 +109,9 @@ class Settings:
     gemini_min_max_tokens: int = 1024        # Gemini fails (u:ai 605) when the token limit is tiny
     enforce_json: bool = True
     allow_http_upstream: bool = False
+    usage_tracking: bool = True
+    usage_file: str | None = None            # None = keep the monthly counter in memory only
+    usage_tz: str = "UTC"                    # time zone that defines where a month starts
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -148,6 +157,9 @@ class Settings:
             gemini_min_max_tokens=_env_num("BRIDGE_GEMINI_MIN_MAX_TOKENS", 1024, int),
             enforce_json=_env_bool("BRIDGE_ENFORCE_JSON", True),
             allow_http_upstream=_env_bool("BRIDGE_ALLOW_HTTP_UPSTREAM"),
+            usage_tracking=_env_bool("BRIDGE_USAGE_TRACKING", True),
+            usage_file=_env("BRIDGE_USAGE_FILE"),
+            usage_tz=_env("BRIDGE_USAGE_TZ", default="UTC") or "UTC",
         )
 
     def validate(self) -> None:
@@ -174,6 +186,11 @@ class Settings:
             raise RuntimeError("BRIDGE_MAX_CONCURRENCY must be >= 1.")
         if not 0 <= self.max_retries <= 5:
             raise RuntimeError("BRIDGE_MAX_RETRIES must be between 0 and 5.")
+        try:
+            ZoneInfo(self.usage_tz)
+        except (ZoneInfoNotFoundError, ValueError) as e:
+            raise RuntimeError(f"BRIDGE_USAGE_TZ is not a known time zone: {self.usage_tz!r} "
+                               "(use an IANA name such as 'UTC' or 'Europe/Vienna').") from e
 
 
 # --------------------------------------------------------------------------- #
@@ -270,6 +287,149 @@ class RateLimiter:
                     return
                 wait = 60.0 - (now - self.events[0]) + 0.01
             await asyncio.sleep(wait)
+
+
+# --------------------------------------------------------------------------- #
+# Monthly usage counter
+# --------------------------------------------------------------------------- #
+MONTH_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
+_COUNTERS = ("requests", "prompt_tokens", "completion_tokens", "total_tokens", "requests_without_usage",
+             "requests_without_price")
+
+
+def _empty_bucket() -> dict:
+    return {**{k: 0 for k in _COUNTERS}, "estimated_cost_usd": 0.0}
+
+
+def account_id(client_id: str) -> str:
+    """Stable, non-reversible label for a u:ai API client (the client ID itself is never stored)."""
+    return hashlib.sha256(client_id.encode()).hexdigest()[:16]
+
+
+class UsageTracker:
+    """Counts requests, tokens and estimated cost per u:ai API client and calendar month.
+
+    The numbers are an estimate built from the token counts u:ai returns and the prices of
+    /api/v1/llm/models at the time of each request. Tailored-AI (RAG) replies carry no token
+    usage, so they are only counted as `requests_without_usage`.
+    """
+
+    def __init__(self, path: str | None, tz: str):
+        self.path = path
+        self.tz = ZoneInfo(tz)
+        self.tz_name = tz
+        self.lock = threading.Lock()
+        self.persistent = False
+        self._warned = False
+        self.data: dict = {"version": 1, "accounts": {}}
+        if path:
+            self._load()
+
+    # -- persistence -------------------------------------------------------
+    def _load(self) -> None:
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                d = json.load(f)
+            if not isinstance(d, dict) or not isinstance(d.get("accounts"), dict):
+                raise ValueError("unexpected structure")
+            self.data = d
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as e:
+            bad = f"{self.path}.corrupt-{int(time.time())}"
+            log.error("Usage file %s is unreadable (%s); starting a new counter, old file kept as %s",
+                      self.path, type(e).__name__, bad)
+            try:
+                os.replace(self.path, bad)
+            except OSError:
+                pass
+        self.persistent = self._write()
+
+    def _write(self) -> bool:
+        """Atomically write the counter. Never raises: a failing disk must not break chat requests."""
+        if not self.path:
+            return False
+        tmp = f"{self.path}.tmp-{os.getpid()}"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.data, f, indent=1, sort_keys=True)
+            os.replace(tmp, self.path)
+            return True
+        except OSError as e:
+            if not self._warned:
+                log.warning("Cannot write usage file %s (%s); the monthly counter is kept in memory only "
+                            "and resets on restart. Mount a writable volume there.", self.path, type(e).__name__)
+                self._warned = True
+            return False
+
+    # -- months --------------------------------------------------------------
+    def month_of(self, when: datetime | None = None) -> str:
+        return (when or datetime.now(timezone.utc)).astimezone(self.tz).strftime("%Y-%m")
+
+    def bounds(self, month: str) -> tuple[datetime, datetime]:
+        y, m = int(month[:4]), int(month[5:7])
+        start = datetime(y, m, 1, tzinfo=self.tz)
+        end = start + timedelta(days=calendar.monthrange(y, m)[1])
+        return start, end.replace(tzinfo=self.tz)
+
+    # -- recording -----------------------------------------------------------
+    def record(self, client_id: str, model: str, usage: dict, cost_usd: float | None,
+               when: datetime | None = None) -> None:
+        now = when or datetime.now(timezone.utc)
+        month = self.month_of(now)
+        with self.lock:
+            acc = self.data["accounts"].setdefault(account_id(client_id), {"months": {}})
+            mon = acc["months"].setdefault(month, {"total": _empty_bucket(), "by_model": {},
+                                                   "first_request": now.isoformat()})
+            mon["last_request"] = now.isoformat()
+            for bucket in (mon["total"], mon["by_model"].setdefault(model, _empty_bucket())):
+                bucket["requests"] += 1
+                for k in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                    bucket[k] += int(usage.get(k) or 0)
+                if not usage.get("total_tokens"):
+                    bucket["requests_without_usage"] += 1
+                elif cost_usd is None:
+                    bucket["requests_without_price"] += 1
+                else:
+                    bucket["estimated_cost_usd"] = round(bucket["estimated_cost_usd"] + cost_usd, 8)
+            self.persistent = self._write() if self.path else False
+
+    # -- reporting -----------------------------------------------------------
+    def months(self, client_id: str) -> list[str]:
+        acc = self.data["accounts"].get(account_id(client_id)) or {}
+        return sorted((acc.get("months") or {}).keys())
+
+    def report(self, client_id: str, month: str | None = None, now: datetime | None = None) -> dict:
+        now = now or datetime.now(timezone.utc)
+        month = month or self.month_of(now)
+        start, end = self.bounds(month)
+        with self.lock:
+            acc = self.data["accounts"].get(account_id(client_id)) or {}
+            mon = json.loads(json.dumps((acc.get("months") or {}).get(month) or {}))
+        total = mon.get("total") or _empty_bucket()
+        out: dict[str, Any] = {
+            "month": month, "timezone": self.tz_name,
+            "period_start": start.isoformat(), "period_end": end.isoformat(),
+            "currency": "USD", **total,
+            "estimated_cost_usd": round(total.get("estimated_cost_usd", 0.0), 6),
+            "by_model": {k: dict(v, estimated_cost_usd=round(v.get("estimated_cost_usd", 0.0), 6))
+                         for k, v in sorted((mon.get("by_model") or {}).items())},
+            "first_request": mon.get("first_request"), "last_request": mon.get("last_request"),
+            "persistent": self.persistent,
+        }
+        if start <= now < end:
+            elapsed = (now - start).total_seconds()
+            span = (end - start).total_seconds()
+            out["month_elapsed_fraction"] = round(elapsed / span, 4)
+            # A linear projection is meaningless in the first hours of a month.
+            if elapsed >= 86400:
+                f = span / elapsed
+                out["projected_month_cost_usd"] = round(total.get("estimated_cost_usd", 0.0) * f, 6)
+                out["projected_month_tokens"] = int(total.get("total_tokens", 0) * f)
+            else:
+                out["projected_month_cost_usd"] = None
+                out["projected_month_tokens"] = None
+        return out
 
 
 # --------------------------------------------------------------------------- #
@@ -782,11 +942,15 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
     s.validate()
     uai = UaiClient(s, transport=transport)
     models_cache: dict[str, tuple[float, list]] = {}
+    usage = UsageTracker(s.usage_file, s.usage_tz) if s.usage_tracking else None
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         log.info("uai-bridge %s started (mode=%s, kb=%s, upstream=%s)", __version__, s.credential_mode,
                  s.enable_kb, s.base_url)
+        if usage is not None:
+            log.info("usage counter: %s (month time zone %s)",
+                     usage.path if usage.persistent else "in memory only (resets on restart)", s.usage_tz)
         yield
         await uai.close()
 
@@ -795,6 +959,7 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
                   openapi_url="/openapi.json" if s.enable_docs else None)
     app.state.settings = s
     app.state.uai = uai
+    app.state.usage = usage
 
     # ---- error handlers ---------------------------------------------------
     @app.exception_handler(BridgeError)
@@ -903,11 +1068,14 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
         tool_calls = parse_tool_calls(content, allowed)
         if want_json and not tool_calls:
             content = extract_json_object(content) or content
+        u = _usage(d)
+        if usage is not None:
+            usage.record(creds[0], model, u, await estimate_cost(creds, model, u))
         cit_text, citations = format_citations(d.get("citations"))
         if cit_text and s.append_citations and not tool_calls and not want_json:
             content += cit_text
         return {"model": model, "content": content, "tool_calls": tool_calls, "citations": citations,
-                "finish": "tool_calls" if tool_calls else _finish(d.get("finishReason")), "usage": _usage(d),
+                "finish": "tool_calls" if tool_calls else _finish(d.get("finishReason")), "usage": u,
                 "adjusted": adjusted}
 
     # ---- health ------------------------------------------------------------
@@ -950,8 +1118,57 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
                 "output_token_limit": m.get("outputTokenLimit"),
                 "input_usd_per_1m_tokens": per_m(costs.get("input_tokens")),
                 "output_usd_per_1m_tokens": per_m(costs.get("output_tokens")),
+                "usd_per_request": costs.get("per_request"),
             }
         return {"currency": "USD", "unit": "per 1M tokens", "models": sheet}
+
+    # ---- monthly usage counter ---------------------------------------------
+    async def estimate_cost(creds: Creds, model: str, u: dict) -> float | None:
+        """USD for one reply from the (cached) u:ai price list; None if no price is known."""
+        if not u.get("total_tokens"):
+            return None
+        try:
+            models = await fetch_models(creds)
+        except BridgeError:
+            return None
+        m = next((x for x in models if str(x.get("modelName", "")).lower() == model.lower()), None)
+        if not m:
+            return None
+        costs = {c.get("costType"): c.get("cost") for c in m.get("costs") or [] if isinstance(c, dict)}
+        try:
+            pin, pout = float(costs["input_tokens"]), float(costs["output_tokens"])
+            # Web-search models (sonar-*) also have a flat fee per request, in USD per single request
+            # (observed live: sonar-pro 0.014, matching the provider's 14 USD per 1 000 requests).
+            per_req = float(costs.get("per_request") or 0.0)
+        except (KeyError, TypeError, ValueError):
+            return None
+        return ((u.get("prompt_tokens", 0) * pin + u.get("completion_tokens", 0) * pout) / s.cost_unit_tokens
+                + per_req)
+
+    def require_usage() -> UsageTracker:
+        if usage is None:
+            raise BridgeError(404, "Not found (usage tracking is disabled; set BRIDGE_USAGE_TRACKING=true).",
+                              "not_found_error")
+        return usage
+
+    @app.get("/v1/usage")
+    async def usage_month(request: Request, month: str | None = None):
+        creds = authenticate(request)
+        t = require_usage()
+        if month is not None and not MONTH_RE.match(month):
+            raise BridgeError(400, "'month' must look like YYYY-MM.", "invalid_request_error")
+        return t.report(creds[0], month)
+
+    @app.get("/v1/usage/history")
+    async def usage_history(request: Request):
+        creds = authenticate(request)
+        t = require_usage()
+        rows = []
+        for m in t.months(creds[0]):
+            r = t.report(creds[0], m)
+            rows.append({k: r[k] for k in ("month", "requests", "prompt_tokens", "completion_tokens", "total_tokens",
+                                           "estimated_cost_usd", "requests_without_usage", "requests_without_price")})
+        return {"timezone": t.tz_name, "currency": "USD", "months": rows}
 
     # ---- OpenAI chat -------------------------------------------------------
     @app.post("/v1/chat/completions")

@@ -5,7 +5,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     BRIDGE_HOST=0.0.0.0 \
-    BRIDGE_PORT=8000
+    BRIDGE_PORT=8000 \
+    BRIDGE_USAGE_FILE=/data/usage.json
 
 WORKDIR /app
 COPY requirements.txt .
@@ -14,7 +15,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY uai_bridge.py .
 
 # Run as an unprivileged user
-RUN useradd --system --uid 10001 --no-create-home --shell /usr/sbin/nologin bridge
+RUN useradd --system --uid 10001 --no-create-home --shell /usr/sbin/nologin bridge \
+ && mkdir /data && chown 10001 /data
+# Monthly usage counter; mount a volume here so it survives container updates
+VOLUME /data
 USER 10001
 
 EXPOSE 8000

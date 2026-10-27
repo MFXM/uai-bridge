@@ -49,7 +49,10 @@ class Upstream:
             return httpx.Response(200, json={"data": [
                 {"modelName": "gpt-4o", "contextWindow": 128000, "outputTokenLimit": 16384,
                  "costs": [{"cost": 0.0025, "costType": "input_tokens"},      # USD per 1 000 tokens
-                           {"cost": 0.01, "costType": "output_tokens"}]}]})
+                           {"cost": 0.01, "costType": "output_tokens"}]},
+                {"modelName": "sonar-pro", "contextWindow": 200000, "outputTokenLimit": 8000,
+                 "costs": [{"cost": 0.003, "costType": "input_tokens"}, {"cost": 0.015, "costType": "output_tokens"},
+                           {"cost": 0.014, "costType": "per_request"}]}]})
         if p == "/api/v1/knowledge-base/" and req.method == "POST":
             return httpx.Response(201, json={"data": {"id": KB, "name": body["name"], "state": "created"}})
         if p == f"/api/v1/knowledge-base/{KB}/files":
@@ -482,3 +485,125 @@ def test_web_citations_format():
                                        "pageContent": "https://www.britannica.com/place/Austria", "type": "website"}])
     assert "- [0] britannica.com <https://www.britannica.com/place/Austria>" in text
     assert clean[0]["url"].startswith("https://") and clean[0]["type"] == "website"
+
+
+
+# ---------------------------------------------------------------- monthly usage counter
+def test_usage_counts_tokens_and_estimated_cost():
+    c, _ = make()
+    assert chat(c).status_code == 200
+    assert c.post("/api/chat", json={"model": "gpt-4o", "stream": False,
+                                     "messages": [{"role": "user", "content": "hi"}]}, headers=AUTH).status_code == 200
+    r = c.get("/v1/usage", headers=AUTH)
+    assert r.status_code == 200
+    u = r.json()
+    assert (u["requests"], u["prompt_tokens"], u["completion_tokens"], u["total_tokens"]) == (2, 6, 4, 10)
+    # 3 input tokens * 0.0025 + 2 output tokens * 0.01, per 1 000 tokens, twice
+    assert u["estimated_cost_usd"] == pytest.approx(2 * (3 * 0.0025 + 2 * 0.01) / 1000)
+    assert u["by_model"]["gpt-4o"]["requests"] == 2
+    assert u["currency"] == "USD" and u["timezone"] == "UTC"
+    assert u["persistent"] is False  # no BRIDGE_USAGE_FILE configured
+    assert "month_elapsed_fraction" in u
+
+
+def test_usage_adds_per_request_fee_of_search_models():
+    c, _ = make()
+    assert chat(c, model="sonar-pro").status_code == 200
+    u = c.get("/v1/usage", headers=AUTH).json()
+    assert u["estimated_cost_usd"] == pytest.approx((3 * 0.003 + 2 * 0.015) / 1000 + 0.014)
+    assert c.get("/v1/pricing", headers=AUTH).json()["models"]["sonar-pro"]["usd_per_request"] == 0.014
+
+
+def test_usage_needs_key_and_validates_month():
+    c, _ = make()
+    assert c.get("/v1/usage").status_code == 401
+    assert c.get("/v1/usage/history").status_code == 401
+    assert c.get("/v1/usage", params={"month": "2026-13"}, headers=AUTH).status_code == 400
+    r = c.get("/v1/usage", params={"month": "2020-01"}, headers=AUTH).json()
+    assert r["requests"] == 0 and "projected_month_cost_usd" not in r  # past month: no projection
+
+
+def test_usage_tailored_reply_counted_without_usage():
+    c, _ = make()
+    assert chat(c, model=f"tailored:{TAI}").status_code == 200
+    u = c.get("/v1/usage", headers=AUTH).json()
+    assert u["requests"] == 1 and u["total_tokens"] == 0 and u["requests_without_usage"] == 1
+    assert u["estimated_cost_usd"] == 0
+
+
+def test_usage_unknown_price_is_flagged_not_guessed():
+    c, _ = make()
+    assert chat(c, model="mistral-large-3").status_code == 200  # not in the fake price list
+    u = c.get("/v1/usage", headers=AUTH).json()
+    assert u["requests_without_price"] == 1 and u["estimated_cost_usd"] == 0 and u["total_tokens"] == 5
+
+
+def test_usage_survives_restart_and_stores_no_client_id(tmp_path):
+    f = tmp_path / "usage.json"
+    c, _ = make(usage_file=str(f))
+    assert chat(c).status_code == 200
+    raw = f.read_text(encoding="utf-8")
+    assert "cid" not in json.loads(raw)["accounts"] and "csecret" not in raw and "hi" not in raw
+    c2, _ = make(usage_file=str(f))  # a new process reading the same file
+    assert chat(c2).status_code == 200
+    u = c2.get("/v1/usage", headers=AUTH).json()
+    assert u["requests"] == 2 and u["persistent"] is True
+    h = c2.get("/v1/usage/history", headers=AUTH).json()
+    assert len(h["months"]) == 1 and h["months"][0]["requests"] == 2
+
+
+def test_usage_unwritable_file_does_not_break_chat(tmp_path):
+    c, _ = make(usage_file=str(tmp_path / "missing-dir" / "usage.json"))
+    assert chat(c).status_code == 200
+    u = c.get("/v1/usage", headers=AUTH).json()
+    assert u["requests"] == 1 and u["persistent"] is False
+
+
+def test_usage_corrupt_file_is_set_aside(tmp_path):
+    f = tmp_path / "usage.json"
+    f.write_text("{not json", encoding="utf-8")
+    c, _ = make(usage_file=str(f))
+    assert chat(c).status_code == 200
+    assert json.loads(f.read_text(encoding="utf-8"))["version"] == 1
+    assert any(p.name.startswith("usage.json.corrupt-") for p in tmp_path.iterdir())
+
+
+def test_usage_month_follows_configured_time_zone():
+    from datetime import datetime, timezone
+    t = b.UsageTracker(None, "Europe/Vienna")
+    late = datetime(2026, 10, 31, 23, 30, tzinfo=timezone.utc)  # already 1 November in Vienna
+    t.record("cid", "gpt-4o", {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}, 0.5, when=late)
+    assert t.months("cid") == ["2026-11"]
+    start, end = t.bounds("2026-11")
+    assert start.isoformat() == "2026-11-01T00:00:00+01:00" and end.isoformat() == "2026-12-01T00:00:00+01:00"
+    with pytest.raises(RuntimeError, match="BRIDGE_USAGE_TZ"):
+        b.Settings(client_id="a", client_secret="b", api_keys=(KEY,), usage_tz="Mars/Olympus").validate()
+
+
+def test_usage_projection_is_linear_and_withheld_on_day_one():
+    from datetime import datetime, timezone
+    t = b.UsageTracker(None, "UTC")
+    u = {"prompt_tokens": 50, "completion_tokens": 50, "total_tokens": 100}
+    t.record("cid", "gpt-4o", u, 1.0, when=datetime(2026, 11, 1, 1, tzinfo=timezone.utc))
+    early = t.report("cid", now=datetime(2026, 11, 1, 12, tzinfo=timezone.utc))
+    assert early["projected_month_cost_usd"] is None
+    mid = t.report("cid", now=datetime(2026, 11, 16, tzinfo=timezone.utc))  # half of a 30-day month
+    assert mid["projected_month_cost_usd"] == pytest.approx(2.0) and mid["projected_month_tokens"] == 200
+
+
+def test_usage_is_separate_per_account_in_passthrough_mode():
+    c, _ = make(credential_mode="passthrough", client_id=None, client_secret=None, api_keys=())
+    alice = {"Authorization": "Bearer alice-id:alice-secret"}
+    bob = {"Authorization": "Bearer bob-id:bob-secret"}
+    body = {"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]}
+    for _ in range(2):
+        assert c.post("/v1/chat/completions", json=body, headers=alice).status_code == 200
+    assert c.post("/v1/chat/completions", json=body, headers=bob).status_code == 200
+    assert c.get("/v1/usage", headers=alice).json()["requests"] == 2
+    assert c.get("/v1/usage", headers=bob).json()["requests"] == 1
+
+
+def test_usage_can_be_disabled():
+    c, _ = make(usage_tracking=False)
+    assert chat(c).status_code == 200
+    assert c.get("/v1/usage", headers=AUTH).status_code == 404
