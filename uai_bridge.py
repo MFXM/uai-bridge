@@ -45,7 +45,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 log = logging.getLogger("uai-bridge")
 
