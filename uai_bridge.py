@@ -630,9 +630,18 @@ SUPPORTED_OPENAI_PARAMS = {
 }
 
 
+# u:ai accepts low/medium/high. Agent clients send the wider OpenAI-compatible set; those values are
+# mapped to the nearest level (None = leave the field out, so the model's default applies).
+REASONING_EFFORTS = ("low", "medium", "high")
+REASONING_EFFORT_ALIASES: dict[str, str | None] = {
+    "none": None, "default": None, "minimal": "low", "xhigh": "high", "max": "high",
+}
+
+
 def translate_params(model: str, *, temperature=None, max_tokens=None, frequency_penalty=None,
                      presence_penalty=None, stop=None, seed=None, response_format=None,
-                     reasoning_effort=None, verbosity=None) -> dict:
+                     reasoning_effort=None, verbosity=None, adjusted: list[str] | None = None) -> dict:
+    """Map OpenAI parameters to u:ai names. Value mappings are appended to `adjusted` (response header)."""
     p: dict[str, Any] = {}
     if temperature is not None:
         p["temperature"] = _num("temperature", temperature, 0.0, 2.0)
@@ -664,9 +673,17 @@ def translate_params(model: str, *, temperature=None, max_tokens=None, frequency
             raise BridgeError(400, "'response_format.type' must be text, json_object or json_schema.",
                               "invalid_request_error")
     if reasoning_effort is not None:
-        if reasoning_effort not in ("low", "medium", "high"):
-            raise BridgeError(400, "'reasoning_effort' must be low, medium or high.", "invalid_request_error")
-        p["reasoningEffort"] = reasoning_effort
+        e = reasoning_effort.strip().lower() if isinstance(reasoning_effort, str) else reasoning_effort
+        if isinstance(e, str) and e in REASONING_EFFORT_ALIASES:
+            mapped = REASONING_EFFORT_ALIASES[e]
+            if adjusted is not None:
+                adjusted.append(f"reasoning_effort:{e}->{mapped or 'omitted'}")
+            e = mapped
+        elif e not in REASONING_EFFORTS:
+            raise BridgeError(400, "'reasoning_effort' must be low, medium or high "
+                              "(none, default, minimal, xhigh and max are mapped).", "invalid_request_error")
+        if e is not None:
+            p["reasoningEffort"] = e
     if verbosity is not None:
         if verbosity not in ("low", "medium", "high"):
             raise BridgeError(400, "'verbosity' must be low, medium or high.", "invalid_request_error")
@@ -1455,7 +1472,7 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
 
     # ---- shared chat core --------------------------------------------------
     async def run_chat(creds: Creds, model_in: Any, messages: Any, params: dict, tools: Any = None,
-                       tool_choice: Any = None) -> dict:
+                       tool_choice: Any = None, notes: list[str] | None = None) -> dict:
         model, tailored_id = resolve_model(model_in, s)
         instruction, allowed = build_tool_instruction(tools, tool_choice)
         want_json = s.enforce_json and (params.get("responseFormat") or {}).get("type") == "json_object"
@@ -1467,7 +1484,7 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
         if tailored_id:
             payload["tailoredAiId"] = tailored_id
         payload.update(params)
-        adjusted: list[str] = []
+        adjusted: list[str] = list(notes or [])
         if model.lower().startswith("gemini") and s.gemini_min_max_tokens > 0:
             if 0 < payload.get("maxTokens", s.gemini_min_max_tokens) < s.gemini_min_max_tokens:
                 payload["maxTokens"] = s.gemini_min_max_tokens
@@ -1633,15 +1650,16 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
         if not tools and isinstance(body.get("functions"), list):  # legacy function calling
             tools = [{"type": "function", "function": f} for f in body["functions"] if isinstance(f, dict)]
         model, _ = resolve_model(body.get("model"), s)
+        notes: list[str] = []
         params = translate_params(
             model, temperature=body.get("temperature"),
             max_tokens=body.get("max_completion_tokens", body.get("max_tokens")),
             frequency_penalty=body.get("frequency_penalty"), presence_penalty=body.get("presence_penalty"),
             stop=body.get("stop"), seed=body.get("seed"), response_format=body.get("response_format"),
-            reasoning_effort=body.get("reasoning_effort"), verbosity=body.get("verbosity"))
+            reasoning_effort=body.get("reasoning_effort"), verbosity=body.get("verbosity"), adjusted=notes)
         ignored = sorted(k for k in body if k not in SUPPORTED_OPENAI_PARAMS)
         r = await run_chat(creds, body.get("model"), body.get("messages"), params, tools,
-                           body.get("tool_choice", body.get("function_call")))
+                           body.get("tool_choice", body.get("function_call")), notes)
         cid, created = f"chatcmpl-{uuid.uuid4().hex[:24]}", int(time.time())
         label = body.get("model") or r["model"]
         message: dict[str, Any] = {"role": "assistant",

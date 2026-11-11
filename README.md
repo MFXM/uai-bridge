@@ -343,6 +343,10 @@ Other parameters (e.g. `top_p`) are ignored and listed in the response header `X
   `BRIDGE_GEMINI_MIN_MAX_TOKENS` (default 1024) is raised to it. You pay only for tokens actually generated.
 - If u:ai rejects a single parameter for a model (e.g. `claude-opus-4-6` rejects `temperature`), the
   bridge retries once without it. A rejected request was not processed, so this cannot double-bill.
+- u:ai accepts `reasoning_effort` `low`, `medium` and `high`. Agent frameworks also send the wider
+  OpenAI-compatible values, which are mapped: `minimal` → `low`, `xhigh` and `max` → `high`, and
+  `none` / `default` leave the field out (the model's default applies), e.g.
+  `X-Bridge-Adjusted-Params: reasoning_effort:xhigh->high`. Other values are rejected with 400.
 
 Errors use the OpenAI shape `{"error": {"message", "type", "code"}}`. u:ai status codes are mapped:
 400/422 → 400, 404 → 404, 429 → 429 (with `Retry-After`), knowledge base not ready → 409,

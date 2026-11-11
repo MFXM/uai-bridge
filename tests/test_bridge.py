@@ -200,6 +200,25 @@ def test_parameter_mapping():
     assert p2["maxCompletionTokens"] == 99 and "maxTokens" not in p2 and p2["reasoningEffort"] == "low"
 
 
+def test_reasoning_effort_aliases_are_mapped():
+    c, up = make()
+    cases = [("xhigh", "high"), ("max", "high"), ("minimal", "low"), ("none", None), ("default", None)]
+    for sent, expected in cases:
+        r = chat(c, model="gpt-5", reasoning_effort=sent)
+        assert r.status_code == 200
+        assert f"reasoning_effort:{sent}->{expected or 'omitted'}" in r.headers["x-bridge-adjusted-params"]
+    for (_sent, expected), p in zip(cases, up.chat_payloads()):
+        assert p.get("reasoningEffort") == expected
+    r = chat(c, model="gpt-5", reasoning_effort="medium")
+    assert up.chat_payloads()[-1]["reasoningEffort"] == "medium" and "x-bridge-adjusted-params" not in r.headers
+    r = chat(c, model="gpt-5", reasoning_effort="xhigh", stream=True)
+    assert r.status_code == 200 and r.headers["x-bridge-adjusted-params"] == "reasoning_effort:xhigh->high"
+    n = len(up.chat_payloads())
+    assert chat(c, model="gpt-5", reasoning_effort="ultra").status_code == 400
+    assert chat(c, model="gpt-5", reasoning_effort=3).status_code == 400
+    assert len(up.chat_payloads()) == n
+
+
 def test_ignored_params_reported_and_invalid_rejected():
     c, up = make()
     r = chat(c, top_p=0.5)

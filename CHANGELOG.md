@@ -2,6 +2,13 @@
 
 All notable changes are documented here. This project uses [Semantic Versioning](https://semver.org/).
 
+## 1.2.1 (2026-11-11)
+**Fixed**
+- `reasoning_effort` values outside u:ai's `low` / `medium` / `high` no longer fail with 400. Agent
+  frameworks send the wider OpenAI-compatible set; `minimal` is mapped to `low`, `xhigh` and `max` to
+  `high`, and `none` / `default` omit the field. Each mapping is reported in `X-Bridge-Adjusted-Params`
+  (e.g. `reasoning_effort:xhigh->high`). Unknown values are still rejected.
+
 ## 1.2.0 (2026-11-11)
 **Optional MCP endpoint for AI agents**
 - `BRIDGE_ENABLE_MCP=true` adds a Model Context Protocol server at `/mcp` (Streamable HTTP, stateless,
