@@ -23,17 +23,18 @@ bases (RAG).
 4. [Quick start without Docker](#quick-start-without-docker)
 5. [Adding the bridge to an existing Docker Compose stack](#adding-the-bridge-to-an-existing-docker-compose-stack)
 6. [Connecting clients](#connecting-clients)
-7. [Endpoints](#endpoints)
-8. [Tailored AIs and knowledge bases](#tailored-ais-and-knowledge-bases)
-9. [Monthly usage](#monthly-usage)
-10. [Configuration reference](#configuration-reference)
-11. [Security](#security)
-12. [Several users](#several-users)
-13. [Limitations of the u:ai API](#limitations-of-the-uai-api)
-14. [Development and tests](#development-and-tests)
-15. [Troubleshooting](#troubleshooting)
-16. [Related projects](#related-projects)
-17. [Acknowledgements](#acknowledgements)
+7. [MCP endpoint for AI agents](#mcp-endpoint-for-ai-agents)
+8. [Endpoints](#endpoints)
+9. [Tailored AIs and knowledge bases](#tailored-ais-and-knowledge-bases)
+10. [Monthly usage](#monthly-usage)
+11. [Configuration reference](#configuration-reference)
+12. [Security](#security)
+13. [Several users](#several-users)
+14. [Limitations of the u:ai API](#limitations-of-the-uai-api)
+15. [Development and tests](#development-and-tests)
+16. [Troubleshooting](#troubleshooting)
+17. [Related projects](#related-projects)
+18. [Acknowledgements](#acknowledgements)
 
 ---
 
@@ -47,10 +48,13 @@ bases (RAG).
   Uploads only.
 - **Monthly usage counter:** `GET /v1/usage` shows requests, tokens and the estimated cost of the
   current month, so you can see how much of your allowance is left.
+- **Optional MCP endpoint:** `/mcp` (Model Context Protocol) lets AI agents and assistants that support
+  MCP use u:ai models as tools: ask another model for a second opinion, research the web with sources,
+  check models, prices and usage. Off by default (`BRIDGE_ENABLE_MCP=true`).
 - **Secure by default:** API key required, binds to `127.0.0.1`, no filesystem access, size limits,
   bounded retries, client-side rate limiting, no prompt logging, non-root read-only container.
-- **One file** (`uai_bridge.py`), five dependencies, tested: 55 unit tests against a mocked API plus a
-  29-check live test against the real u:ai API.
+- **One file** (`uai_bridge.py`), six dependencies (the MCP SDK is only loaded when the endpoint is
+  enabled), tested: 69 unit tests against a mocked API plus a live test against the real u:ai API.
 
 ## Before you start: u:ai API access
 1. **Request an API account** through the ZID Servicedesk; see
@@ -248,6 +252,74 @@ curl -H "Authorization: Bearer <bridge key>" -H "Content-Type: application/json"
 Tools that support function/tool calling work through the bridge's emulated tool calls (see
 [Limitations](#limitations-of-the-uai-api)).
 
+## MCP endpoint for AI agents
+The bridge can also act as an [MCP](https://modelcontextprotocol.io) server. The REST endpoints above
+are for programs you configure yourself; the MCP endpoint is for **AI agents** (desktop assistants,
+coding agents, agent frameworks) that discover tools at runtime and decide themselves when to call
+them. The agent's own model stays in charge, and u:ai models become tools it can consult.
+
+Enable it in `.env` and restart:
+```bash
+BRIDGE_ENABLE_MCP=true
+```
+The endpoint is `http://<host>:8000/mcp` (Streamable HTTP, stateless, JSON responses). It uses the same
+bridge key as the REST API (`Authorization: Bearer <key>`), and in `passthrough` mode the caller's own
+u:ai credentials. It speaks the current stateless MCP revision (2026-07-28) and the older
+handshake-based revisions (2024-11-05 to 2025-11-25) on the same URL, so older and newer clients both work.
+
+**Tools**
+
+| Tool | Billed | Purpose |
+|---|---|---|
+| `ask` | yes | answer from a u:ai model (`prompt`, optional `model`, `system`, `max_tokens`, `temperature`, `reasoning_effort`); `model: "tailored:<id>"` asks a Tailored AI |
+| `web_research` | yes | web research with a `sonar-*` model (default `BRIDGE_MCP_RESEARCH_MODEL`); returns the answer and its sources with URLs |
+| `list_models` | no | available models with context window, output limit and prices |
+| `usage` | no | estimated cost of a month (as `GET /v1/usage`) plus today's MCP calls and the daily cap; only with usage tracking on |
+
+Every tool result has the answer as text (what the agent reads) and the details (model, finish reason,
+token usage, citations) as structured content. Upstream errors come back as tool errors with the u:ai
+message, so the agent can react instead of failing.
+
+**Guard rails.** An agent can call a tool far more often than a person would, so the billed tools have
+extra limits on top of the bridge's rate limit:
+- `BRIDGE_MCP_MAX_CALLS_PER_DAY` (default 1000) caps `ask` and `web_research` calls per u:ai client and
+  day (days follow `BRIDGE_USAGE_TZ`; `0` = no cap). The counter is kept in memory and resets on restart.
+  Set it to what fits your own allowance.
+- `BRIDGE_MCP_MAX_TOKENS` (default 16000) is the default answer length and the largest `max_tokens` a
+  tool call may request. It is lowered automatically to the model's own output limit.
+- Requests that carry a browser `Origin` header are rejected unless the origin is listed in
+  `BRIDGE_MCP_ALLOWED_ORIGINS` (protection against DNS rebinding, as the MCP specification requires).
+  Desktop and command-line clients send no `Origin` and are not affected.
+
+**Connecting a client.** Most MCP clients take a server URL and a header. A typical JSON configuration:
+```json
+{
+  "mcpServers": {
+    "uai": {
+      "type": "http",
+      "url": "http://127.0.0.1:8000/mcp",
+      "headers": { "Authorization": "Bearer <bridge key>" }
+    }
+  }
+}
+```
+The exact keys differ between clients; look for "Streamable HTTP" or "HTTP" MCP servers in your
+client's documentation. Clients that only support local (stdio) servers can reach the endpoint
+through an MCP proxy that forwards stdio to Streamable HTTP. A quick check with curl:
+```bash
+curl -s http://127.0.0.1:8000/mcp -H "Authorization: Bearer <bridge key>" \
+     -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" \
+     -H "MCP-Protocol-Version: 2026-07-28" -H "Mcp-Method: tools/list" \
+     -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}'
+```
+
+Notes:
+- Remote MCP clients that run in the cloud (not on your machine) need a public HTTPS URL. Do not
+  publish the bridge for this without a TLS reverse proxy and a strong key, and keep in mind that the
+  calls are billed to your u:ai account.
+- The MCP SDK adds about 15 MB to the Docker image. It is imported only when `BRIDGE_ENABLE_MCP=true`,
+  so it costs nothing at runtime otherwise.
+
 ## Endpoints
 | Method & path | Auth | Purpose |
 |---|---|---|
@@ -258,6 +330,7 @@ Tools that support function/tool calling work through the bridge's emulated tool
 | `GET /v1/usage`, `GET /v1/usage/history` | yes | requests, tokens and estimated cost per month (see [Monthly usage](#monthly-usage)) |
 | `GET /api/tags`, `POST /api/chat`, `GET /api/version` | yes (`/api/version` no) | Ollama compatibility |
 | `/v1/uai/...` | yes | knowledge bases and Tailored AIs, only with `BRIDGE_ENABLE_KB=true` |
+| `POST /mcp` | yes | MCP endpoint for AI agents, only with `BRIDGE_ENABLE_MCP=true` (see [MCP endpoint](#mcp-endpoint-for-ai-agents)) |
 
 Supported chat parameters: `temperature`, `max_tokens` / `max_completion_tokens` (mapped to
 `maxTokens` or, for o-series and gpt-5 models, `maxCompletionTokens`), `frequency_penalty`,
@@ -384,11 +457,17 @@ All settings are environment variables; see `.env.example` for a commented templ
 | `BRIDGE_INGEST_TIMEOUT_S` / `BRIDGE_INGEST_POLL_S` | `600` / `5` | waiting for knowledge-base ingestion |
 | `BRIDGE_MODELS_CACHE_S` | `300` | cache for the model list |
 | `BRIDGE_ENFORCE_JSON` | `true` | with `response_format: json_object`, instruct the model and extract the JSON from the reply |
+| `BRIDGE_TOOL_REPAIR_RETRIES` | `1` | extra (billed) requests when an emulated tool call is unusable or a required call is missing (0-2, 0 = off) |
 | `BRIDGE_GEMINI_MIN_MAX_TOKENS` | `1024` | lower bound for `max_tokens` on Gemini models (0 = off) |
 | `BRIDGE_COST_UNIT_TOKENS` | `1000` | number of tokens the u:ai `cost` values refer to (for `/v1/pricing`) |
 | `BRIDGE_USAGE_TRACKING` | `true` | monthly usage counter and `/v1/usage` |
 | `BRIDGE_USAGE_FILE` | – (Docker: `/data/usage.json`) | where the counter is stored; unset = in memory only |
 | `BRIDGE_USAGE_TZ` | `UTC` | time zone in which months start (IANA name, e.g. `Europe/Vienna`) |
+| `BRIDGE_ENABLE_MCP` | `false` | MCP endpoint at `/mcp` |
+| `BRIDGE_MCP_MAX_CALLS_PER_DAY` | `1000` | billed MCP tool calls (`ask`, `web_research`) per u:ai client and day (0 = no cap) |
+| `BRIDGE_MCP_MAX_TOKENS` | `16000` | default and maximum `max_tokens` of MCP tool calls (capped further at the model's output limit) |
+| `BRIDGE_MCP_RESEARCH_MODEL` | `sonar-pro` | default model of the `web_research` tool |
+| `BRIDGE_MCP_ALLOWED_ORIGINS` | – | comma-separated browser origins allowed to call `/mcp` (e.g. `https://chat.example.org`); requests with any other `Origin` get 403 |
 | `BRIDGE_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, … |
 
 ## Security
@@ -403,7 +482,10 @@ All settings are environment variables; see `.env.example` for a commented templ
 - **Secrets:** the u:ai secret is sent only to `UAI_BASE_URL` over HTTPS and never appears in responses
   or logs. Logs contain only method, path, status and duration, never prompts, answers or documents.
 - **Cost protection:** read timeouts are never retried (the request may already be billed). Retries are
-  bounded, and a client-side rate limiter keeps you under the API limit.
+  bounded, and a client-side rate limiter keeps you under the API limit. The optional MCP endpoint adds a
+  daily cap on billed tool calls and an upper bound on answer length.
+- **MCP endpoint:** off by default; same key check as every other endpoint, browser `Origin`s rejected
+  unless allowed, no tools that touch files, knowledge bases or settings.
 - **Container:** unprivileged user, read-only filesystem, all capabilities dropped, memory limit.
 - **Data isolation:** the u:ai API is stateless. All users of one bridge in `static` mode share one
   API client, and with it its usage, costs, knowledge bases and Tailored AIs. Conversations are not
@@ -431,8 +513,11 @@ possible:
   starting with `### SYSTEM INSTRUCTION ###`; tool results start with `### TOOL RESULT [...] ###`;
   consecutive messages of the same role are merged.
 - **No native tool calling:** tools are described in the prompt, and the model must answer with a JSON
-  object `{"tool_calls": [...]}`. Only a reply that is *entirely* such an object naming an offered tool
-  becomes a tool call. Reliability depends on the model (gpt-4o / gpt-5 work best).
+  object `{"tool_calls": [...]}`. A reply that ends with such an object (optionally after a short
+  sentence) and names offered tools becomes a tool call; JSON inside prose stays text. Common slips
+  (single backslashes in Windows paths, `functions.` prefixes, several objects) are tolerated, and an
+  unusable call is re-requested once (`BRIDGE_TOOL_REPAIR_RETRIES`). Reliability still depends on the
+  model; the `X-Bridge-Tool-Calls` response header shows what happened.
 - **JSON mode is not enforced upstream:** u:ai accepts `responseFormat: json_object`, but models still
   answer e.g. "Here is the JSON: \`\`\`json {…} \`\`\`". The bridge adds an instruction and extracts the JSON
   object (`BRIDGE_ENFORCE_JSON`).
@@ -451,13 +536,14 @@ possible:
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
-pytest -q          # 55 tests against a mocked u:ai API, no network or credits needed
+pytest -q          # 69 tests against a mocked u:ai API, no network or credits needed
 ```
 
 **End-to-end check against the real API** (uses a few cents of your credit; creates and deletes a tiny
 Tailored AI with `--kb`):
 ```bash
 BRIDGE_URL=http://127.0.0.1:8000 BRIDGE_KEY=<bridge key> python tests/live_check.py --kb
+# add --mcp to also check the MCP endpoint (needs BRIDGE_ENABLE_MCP=true; one short billed call)
 # in Docker:  docker exec -e BRIDGE_KEY=<key> uai-bridge python /app/live_check.py --kb
 #   (copy tests/live_check.py into the container first, or run it from the host)
 ```
@@ -467,7 +553,8 @@ streaming, error mapping, Ollama endpoints, Mistral/Gemini/Claude/Sonar models, 
 Tailored AI creation, retrieval with citations, and cleanup.
 The tests cover authentication, the absence of any server-file-path endpoint, message and parameter translation,
 tool-call parsing, error mapping and retry rules, streaming format, citations, pricing, Ollama
-compatibility, the knowledge-base workflow including cleanup, and the monthly usage counter.
+compatibility, the knowledge-base workflow including cleanup, the monthly usage counter, and the MCP
+endpoint (both protocol revisions, auth and Origin checks, tools, daily cap, token limits, passthrough).
 
 ## Troubleshooting
 | Symptom | Cause / fix |
@@ -482,7 +569,7 @@ compatibility, the knowledge-base workflow including cleanup, and the monthly us
 | `504 upstream_timeout` | very long generation; raise `BRIDGE_UPSTREAM_TIMEOUT_S` |
 | HTTP 403 "only possible from within EU and EFTA" | you are outside the EU/EFTA (e.g. a non-EU VPN exit) |
 | A client shows an empty model list | the bridge key is missing in the client's settings, or the bridge can't reach u:ai (`docker compose logs uai-bridge`) |
-| Tool calls come back as plain text | the model did not follow the JSON format; try `tool_choice: "required"` or a stronger model |
+| Tool calls come back as plain text | check the `X-Bridge-Tool-Calls` header: `failed` = the call stayed unusable after the repair request, `text` = the model answered without calling a tool. Try a stronger model or `tool_choice: "required"`; the bridge log names the reason (never the content) |
 
 ## Related projects
 - ZID u:ai API access page and example code: <https://zid.univie.ac.at/en/uai/uai-api-access>

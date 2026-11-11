@@ -1,8 +1,9 @@
 """Live end-to-end check of a running bridge against the REAL u:ai API.
 
 Uses a few cents of API credit. Run where the bridge is reachable:
-    BRIDGE_URL=http://127.0.0.1:8000 BRIDGE_KEY=... python tests/live_check.py [--kb]
+    BRIDGE_URL=http://127.0.0.1:8000 BRIDGE_KEY=... python tests/live_check.py [--kb] [--mcp]
 --kb also creates a tiny Tailored AI + knowledge base and deletes them again.
+--mcp also checks the MCP endpoint (needs BRIDGE_ENABLE_MCP=true on the bridge).
 Prints only PASS/FAIL lines and short answer snippets, never credentials.
 """
 import json
@@ -263,10 +264,45 @@ def t_kb():
               f"{len(left)} KBs on account")
 
 
+# ---------------------------------------------------------------- MCP endpoint (--mcp)
+def mcp_rpc(method, params=None, name=None):
+    meta = {"io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientInfo": {"name": "live_check", "version": "1"},
+            "io.modelcontextprotocol/clientCapabilities": {}}
+    h = {**H, "Accept": "application/json, text/event-stream", "MCP-Protocol-Version": "2026-07-28",
+         "Mcp-Method": method}
+    if name:
+        h["Mcp-Name"] = name
+    return c.post("/mcp", headers=h, json={"jsonrpc": "2.0", "id": 1, "method": method,
+                                            "params": {**(params or {}), "_meta": meta}})
+
+
+def t_mcp():
+    r = c.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+               headers={"Accept": "application/json, text/event-stream"})
+    check("mcp: no key -> 401", r.status_code == 401, str(r.status_code))
+    r = mcp_rpc("tools/list")
+    names = sorted(t["name"] for t in r.json().get("result", {}).get("tools", [])) if r.status_code == 200 else []
+    check("mcp: tools/list", {"ask", "web_research", "list_models"} <= set(names), f"{r.status_code} {names}")
+    m = pick("gpt-4o-mini", "gpt-4o")
+    r = mcp_rpc("tools/call", {"name": "ask", "arguments": {
+        "model": m, "prompt": "Reply with exactly the word PONG and nothing else.", "max_tokens": 10}}, name="ask")
+    res = r.json().get("result", {}) if r.status_code == 200 else {}
+    txt = (res.get("content") or [{}])[0].get("text", "")
+    check(f"mcp: ask ({m})", not res.get("isError") and "PONG" in txt.upper()
+          and (res.get("structuredContent") or {}).get("usage", {}).get("total_tokens", 0) > 0, snip(txt))
+    r = mcp_rpc("tools/call", {"name": "list_models", "arguments": {}}, name="list_models")
+    res = r.json().get("result", {}) if r.status_code == 200 else {}
+    check("mcp: list_models with prices", any(x.get("input_usd_per_1m_tokens") is not None
+                                              for x in (res.get("structuredContent") or {}).get("models", [])))
+
+
 tests = [t_health, t_auth, t_models, t_simple, t_system_and_multiturn, t_reasoning_tokens, t_json_mode,
          t_tools, t_no_tool_needed, t_stream, t_errors, t_ollama, t_other_vendors, t_pricing, t_usage]
 if "--kb" in sys.argv:
     tests.append(t_kb)
+if "--mcp" in sys.argv:
+    tests.append(t_mcp)
 for t in tests:
     step(t.__name__, t)
 print(f"\n{sum(results)}/{len(results)} checks passed")

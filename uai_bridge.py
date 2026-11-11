@@ -12,6 +12,8 @@ Security model (summary, see README.md):
     client-side rate limiting, request/upload size limits, no prompt logging.
   * Optional monthly usage counter (tokens + estimated USD): stores only counts,
     model names and a hash of the u:ai client ID - never prompts or answers.
+  * Optional MCP endpoint (BRIDGE_ENABLE_MCP=true) at /mcp for AI agents: same key,
+    same upstream path and limits, a per-day call cap and Origin checks.
 
 Developed with the help of AI coding assistants (Anthropic Claude Opus, Google Gemini); see README.
 """
@@ -30,19 +32,20 @@ import re
 import threading
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Annotated, Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 from fastapi import FastAPI, File, Form, Request, UploadFile
+from pydantic import Field
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 log = logging.getLogger("uai-bridge")
 
@@ -108,10 +111,16 @@ class Settings:
     cost_unit_tokens: float = 1000.0         # u:ai reports cost per 1 000 tokens (observed live)
     gemini_min_max_tokens: int = 1024        # Gemini fails (u:ai 605) when the token limit is tiny
     enforce_json: bool = True
+    tool_repair_retries: int = 1             # re-ask once when an emulated tool call is unusable
     allow_http_upstream: bool = False
     usage_tracking: bool = True
     usage_file: str | None = None            # None = keep the monthly counter in memory only
     usage_tz: str = "UTC"                    # time zone that defines where a month starts
+    enable_mcp: bool = False                 # MCP endpoint at /mcp (needs the 'mcp' package)
+    mcp_max_calls_per_day: int = 1000        # ask/web_research calls per u:ai client and day (0 = no cap)
+    mcp_max_tokens: int = 16000              # default and upper bound for max_tokens of MCP tools
+    mcp_research_model: str = "sonar-pro"    # default model of the web_research tool
+    mcp_allowed_origins: tuple[str, ...] = ()  # browser origins allowed to call /mcp (others: 403)
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -156,10 +165,18 @@ class Settings:
             cost_unit_tokens=_env_num("BRIDGE_COST_UNIT_TOKENS", 1000.0),
             gemini_min_max_tokens=_env_num("BRIDGE_GEMINI_MIN_MAX_TOKENS", 1024, int),
             enforce_json=_env_bool("BRIDGE_ENFORCE_JSON", True),
+            tool_repair_retries=_env_num("BRIDGE_TOOL_REPAIR_RETRIES", 1, int),
             allow_http_upstream=_env_bool("BRIDGE_ALLOW_HTTP_UPSTREAM"),
             usage_tracking=_env_bool("BRIDGE_USAGE_TRACKING", True),
             usage_file=_env("BRIDGE_USAGE_FILE"),
             usage_tz=_env("BRIDGE_USAGE_TZ", default="UTC") or "UTC",
+            enable_mcp=_env_bool("BRIDGE_ENABLE_MCP"),
+            mcp_max_calls_per_day=_env_num("BRIDGE_MCP_MAX_CALLS_PER_DAY", 1000, int),
+            mcp_max_tokens=_env_num("BRIDGE_MCP_MAX_TOKENS", 16000, int),
+            mcp_research_model=_env("BRIDGE_MCP_RESEARCH_MODEL", default="sonar-pro") or "sonar-pro",
+            mcp_allowed_origins=tuple(o.strip().rstrip("/") for o in
+                                      (_env("BRIDGE_MCP_ALLOWED_ORIGINS", default="") or "").split(",")
+                                      if o.strip()),
         )
 
     def validate(self) -> None:
@@ -186,6 +203,17 @@ class Settings:
             raise RuntimeError("BRIDGE_MAX_CONCURRENCY must be >= 1.")
         if not 0 <= self.max_retries <= 5:
             raise RuntimeError("BRIDGE_MAX_RETRIES must be between 0 and 5.")
+        if not 0 <= self.tool_repair_retries <= 2:
+            raise RuntimeError("BRIDGE_TOOL_REPAIR_RETRIES must be between 0 and 2.")
+        if self.mcp_max_calls_per_day < 0:
+            raise RuntimeError("BRIDGE_MCP_MAX_CALLS_PER_DAY must be >= 0 (0 = no cap).")
+        if self.mcp_max_tokens < 1:
+            raise RuntimeError("BRIDGE_MCP_MAX_TOKENS must be >= 1.")
+        if not MODEL_NAME_RE.match(self.mcp_research_model):
+            raise RuntimeError(f"BRIDGE_MCP_RESEARCH_MODEL is not a valid model name: {self.mcp_research_model!r}")
+        for o in self.mcp_allowed_origins:
+            if not re.match(r"^https?://[^/\s]+$", o):
+                raise RuntimeError(f"BRIDGE_MCP_ALLOWED_ORIGINS entries must look like https://host[:port], got {o!r}")
         try:
             ZoneInfo(self.usage_tz)
         except (ZoneInfoNotFoundError, ValueError) as e:
@@ -432,6 +460,41 @@ class UsageTracker:
         return out
 
 
+class DailyCallBudget:
+    """Per-day cap on billed MCP tool calls, per u:ai API client (in memory, resets on restart).
+
+    An AI agent can call a tool in a loop in a way a hand-written client would not; this cap bounds the
+    damage. Days follow the usage time zone. Attempts are counted, including ones that fail upstream.
+    """
+
+    def __init__(self, limit: int, tz: str):
+        self.limit = limit
+        self.tz = ZoneInfo(tz)
+        self.lock = threading.Lock()
+        self.day = ""
+        self.counts: dict[str, int] = {}
+
+    def _today(self, now: datetime | None) -> str:
+        return (now or datetime.now(timezone.utc)).astimezone(self.tz).strftime("%Y-%m-%d")
+
+    def take(self, client_id: str, now: datetime | None = None) -> bool:
+        """Count one call; False (and nothing counted) if the cap is reached."""
+        with self.lock:
+            today = self._today(now)
+            if today != self.day:
+                self.day, self.counts = today, {}
+            key = account_id(client_id)
+            used = self.counts.get(key, 0)
+            if self.limit and used >= self.limit:
+                return False
+            self.counts[key] = used + 1
+            return True
+
+    def used(self, client_id: str, now: datetime | None = None) -> int:
+        with self.lock:
+            return self.counts.get(account_id(client_id), 0) if self._today(now) == self.day else 0
+
+
 # --------------------------------------------------------------------------- #
 # Upstream client
 # --------------------------------------------------------------------------- #
@@ -666,19 +729,39 @@ def _args_obj(a: Any) -> Any:
     return a
 
 
-def to_uai_messages(messages: Any, image_mode: str = "placeholder", tool_instruction: str = "") -> list[dict]:
+def to_uai_messages(messages: Any, image_mode: str = "placeholder", tool_instruction: str = "",
+                    tool_reminder: str = "") -> list[dict]:
     """Convert OpenAI/Ollama messages to u:ai messages: only 'user'/'assistant' roles,
-    no consecutive identical roles, no empty messages."""
+    no consecutive identical roles, no empty messages.
+
+    The tool instruction is placed after the client's leading system messages, so it is read after
+    (and takes precedence over) a client prompt that assumes native tool calling. The short
+    reminder is appended to the last message when that message is the user's or a tool result."""
     if not isinstance(messages, list):
         raise BridgeError(400, "'messages' must be a list.", "invalid_request_error")
     out: list[list] = []
-    if tool_instruction:
-        out.append(["user", [_text("### SYSTEM INSTRUCTION ###\n" + tool_instruction)]])
     has_content = False
+    names_by_id: dict[str, str] = {}   # tool_call_id -> tool name, to label tool results
+    pending_instruction = tool_instruction
+
+    def emit(role: str, parts: list[dict]) -> None:
+        if out and out[-1][0] == role:
+            prev = out[-1][1]
+            if prev and prev[-1].get("type") == "text" and parts[0].get("type") == "text":
+                prev[-1] = _text(prev[-1]["text"] + "\n\n" + parts[0]["text"])
+                prev.extend(parts[1:])
+            else:
+                prev.extend(parts)
+        else:
+            out.append([role, list(parts)])
+
     for m in messages:
         if not isinstance(m, dict):
             raise BridgeError(400, "Each message must be an object.", "invalid_request_error")
         role = str(m.get("role", "user")).lower().strip()
+        if pending_instruction and role not in ("system", "developer"):
+            emit("user", [_text("### SYSTEM INSTRUCTION ###\n" + pending_instruction)])
+            pending_instruction = ""
         parts = _to_parts(m.get("content"), image_mode)
         imgs = m.get("images")  # Ollama-style images (base64 strings)
         if isinstance(imgs, list):
@@ -690,6 +773,8 @@ def to_uai_messages(messages: Any, image_mode: str = "placeholder", tool_instruc
             calls = []
             for tc in m.get("tool_calls") or []:
                 fn = (tc or {}).get("function") or {}
+                if tc and tc.get("id") and fn.get("name"):
+                    names_by_id[str(tc["id"])] = str(fn["name"])
                 calls.append({"name": fn.get("name"), "arguments": _args_obj(fn.get("arguments", {}))})
             if isinstance(m.get("function_call"), dict):
                 fc = m["function_call"]
@@ -700,7 +785,9 @@ def to_uai_messages(messages: Any, image_mode: str = "placeholder", tool_instruc
             role = "user"
             parts = _prefix(parts, "### SYSTEM INSTRUCTION ###\n") if parts else []
         elif role in ("tool", "function"):
-            label = m.get("name") or m.get("tool_call_id") or "tool"
+            cid = str(m.get("tool_call_id") or "")
+            name = m.get("name") or names_by_id.get(cid)
+            label = f"{name} | {cid}" if name and cid and name != cid else (name or cid or "tool")
             role = "user"
             parts = _prefix(parts or [_text("(empty result)")], f"### TOOL RESULT [{label}] ###\n")
         elif role != "user":
@@ -710,23 +797,24 @@ def to_uai_messages(messages: Any, image_mode: str = "placeholder", tool_instruc
         if not parts:
             continue
         has_content = True
-        if out and out[-1][0] == role:
-            prev = out[-1][1]
-            if prev and prev[-1].get("type") == "text" and parts[0].get("type") == "text":
-                prev[-1] = _text(prev[-1]["text"] + "\n\n" + parts[0]["text"])
-                prev.extend(parts[1:])
-            else:
-                prev.extend(parts)
-        else:
-            out.append([role, list(parts)])
+        emit(role, parts)
     if not has_content:
         raise BridgeError(400, "'messages' must contain at least one non-empty message.", "invalid_request_error")
+    if pending_instruction:          # only system messages were sent
+        emit("user", [_text("### SYSTEM INSTRUCTION ###\n" + pending_instruction)])
+    if tool_reminder and out and out[-1][0] == "user" and len(out) > 2:
+        emit("user", [_text("### SYSTEM INSTRUCTION ###\n" + tool_reminder)])
     return [{"role": r, "content": _collapse(p)} for r, p in out]
 
 
 # --------------------------------------------------------------------------- #
 # Tool-call emulation (u:ai has no native tool calling)
 # --------------------------------------------------------------------------- #
+TOOL_REMINDER = ("Reminder: to call tools, end your reply with one JSON object "
+                 '{"tool_calls": [{"name": ..., "arguments": {...}}]} and write nothing after it. '
+                 "Never write a '### TOOL RESULT' block yourself; results are sent to you.")
+
+
 def build_tool_instruction(tools: Any, tool_choice: Any) -> tuple[str, set[str]]:
     if not tools or tool_choice == "none":
         return "", set()
@@ -743,11 +831,18 @@ def build_tool_instruction(tools: Any, tool_choice: Any) -> tuple[str, set[str]]
         return "", set()
     names = {f["name"] for f in funcs}
     lines = [
-        "You can call tools. To call one or more tools, reply with ONLY one JSON object and nothing else "
-        "(no markdown code fences, no explanation before or after):",
+        "TOOL PROTOCOL. This conversation has no native tool-calling channel. It overrides any other "
+        "instruction about how to invoke tools. To call one or more tools, reply with ONLY one JSON "
+        "object and nothing else (no markdown code fences, no explanation before or after):",
         '{"tool_calls": [{"name": "<tool name>", "arguments": {<arguments matching the parameter schema>}}]}',
-        "If you do not need a tool, answer normally in plain text and do not output JSON of that shape.",
-        "Tool results are sent back to you in messages that start with '### TOOL RESULT'.",
+        "Rules:",
+        "- Use the tool names exactly as listed below (no 'functions.' prefix).",
+        "- The JSON must be valid: escape backslashes and quotes inside strings, e.g. a Windows path is "
+        '"C:\\\\Users\\\\name".',
+        "- Independent calls go into the same tool_calls list; do not write several JSON objects.",
+        "- After the JSON, stop. Never write a tool result yourself and never guess it. Results are sent "
+        "back to you in messages that start with '### TOOL RESULT [<tool name> | <call id>]'.",
+        "- If you do not need a tool, answer normally in plain text and do not output JSON of that shape.",
         "Available tools:",
     ]
     for f in funcs:
@@ -763,47 +858,167 @@ def build_tool_instruction(tools: Any, tool_choice: Any) -> tuple[str, set[str]]
 
 
 FENCE_RE = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.DOTALL | re.IGNORECASE)
+FENCE_LINE_RE = re.compile(r"^[ \t]*```[A-Za-z0-9_-]*[ \t]*$", re.MULTILINE)
+FAKE_RESULT_RE = re.compile(r"^[ \t]*#{2,}[ \t]*TOOL RESULT\b", re.MULTILINE | re.IGNORECASE)
+BAD_ESCAPE_RE = re.compile(r'\\(?!["\\/bfnrt]|u[0-9a-fA-F]{4})')
+NAME_PREFIX_RE = re.compile(r"^(?:functions|function|tools|tool)[.:]", re.IGNORECASE)
+
+
+@dataclass
+class ToolParse:
+    """Result of reading a model reply for emulated tool calls.
+
+    calls:   OpenAI tool_calls, or None when the reply is treated as plain text.
+    content: text to return alongside the calls (a short preamble), or the full reply.
+    error:   set when the reply clearly TRIED to call a tool but the call is unusable
+             (invalid JSON, unknown tool, non-object arguments); a repair request can fix it.
+    """
+    calls: list[dict] | None
+    content: str
+    error: str | None = None
+
+
+def _balanced_end(t: str, i: int) -> int | None:
+    """Index just after the JSON object that starts at t[i] == '{' (string-aware), or None."""
+    depth, in_str, esc = 0, False, False
+    for j in range(i, len(t)):
+        ch = t[j]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return j + 1
+    return None
+
+
+def _loads_lenient(seg: str) -> Any:
+    try:
+        return json.loads(seg)
+    except ValueError:
+        pass
+    # Models often write Windows paths with single backslashes ("C:\Users\..."), which is invalid
+    # JSON ("\U", "\D", ...). Double every backslash that does not start a valid escape.
+    try:
+        return json.loads(BAD_ESCAPE_RE.sub(r"\\\\", seg))
+    except ValueError:
+        return None
+
+
+def _raw_calls(obj: Any) -> list | None:
+    """The list of call objects in one of the accepted envelopes, else None."""
+    if not isinstance(obj, dict):
+        return None
+    if isinstance(obj.get("tool_calls"), list):
+        return obj["tool_calls"]
+    if "tool" in obj and isinstance(obj.get("tool"), str):          # compact {"tool": ..., "args": {...}}
+        return [{"name": obj["tool"], "arguments": obj.get("args", obj.get("arguments", {}))}]
+    if isinstance(obj.get("name"), str) and ("arguments" in obj or "parameters" in obj):
+        return [{"name": obj["name"], "arguments": obj.get("arguments", obj.get("parameters", {}))}]
+    if isinstance(obj.get("function"), dict) and isinstance(obj["function"].get("name"), str):
+        return [obj]
+    return None
+
+
+def _resolve_tool_name(name: Any, allowed: set[str]) -> str | None:
+    if not isinstance(name, str):
+        return None
+    n = name.strip()
+    if n in allowed:
+        return n
+    n = NAME_PREFIX_RE.sub("", n)
+    if n in allowed:
+        return n
+    low = [a for a in allowed if a.lower() == n.lower()]
+    return low[0] if len(low) == 1 else None
+
+
+def parse_tool_reply(text: str, allowed: set[str]) -> ToolParse:
+    """Find emulated tool calls in a model reply.
+
+    Accepted: the reply is a tool-call JSON object, optionally fenced, optionally preceded by a short
+    preamble (returned as content), optionally split into several such objects. Not accepted: JSON
+    followed by more prose (an example or explanation, not a call). A '### TOOL RESULT' block the
+    model invented after its call is cut off before parsing."""
+    if not allowed or not text:
+        return ToolParse(None, text or "")
+    t = text.strip()
+    fake = FAKE_RESULT_RE.search(t)
+    if fake and "{" in t[:fake.start()]:
+        t = t[:fake.start()].rstrip()
+    spans: list[tuple[int, int, Any]] = []
+    i, broken = 0, False
+    while True:
+        i = t.find("{", i)
+        if i < 0:
+            break
+        end = _balanced_end(t, i)
+        if end is None:
+            broken = broken or '"tool_calls"' in t[i:] or '"tool"' in t[i:]
+            break
+        seg = t[i:end]
+        obj = _loads_lenient(seg)
+        if _raw_calls(obj) is not None:
+            spans.append((i, end, obj))
+        elif obj is None and ('"tool_calls"' in seg or '"name"' in seg):
+            broken = True
+        i = end
+    if not spans:
+        if broken:
+            return ToolParse(None, text, "the tool-call JSON is invalid or incomplete")
+        return ToolParse(None, text)
+    tail = FENCE_LINE_RE.sub("", t[spans[-1][1]:]).strip()
+    if tail:
+        return ToolParse(None, text)       # JSON followed by prose: an example, not a call
+    between = "".join(FENCE_LINE_RE.sub("", t[a[1]:b[0]]).strip() for a, b in zip(spans, spans[1:]))
+    if between:
+        return ToolParse(None, text)
+    preamble = FENCE_LINE_RE.sub("", t[:spans[0][0]]).strip()
+    calls = []
+    for _, _, obj in spans:
+        for c in _raw_calls(obj):
+            if not isinstance(c, dict):
+                return ToolParse(None, text, "each entry of tool_calls must be an object")
+            fn = c.get("function") if isinstance(c.get("function"), dict) else {}
+            raw_name = c.get("name") or fn.get("name")
+            name = _resolve_tool_name(raw_name, allowed)
+            if name is None:
+                return ToolParse(None, text, f"unknown tool {str(raw_name)[:60]!r}; available: "
+                                             + ", ".join(sorted(allowed))[:600])
+            args = c.get("arguments", c.get("args", c.get("parameters", fn.get("arguments", {}))))
+            if isinstance(args, str):
+                args = _loads_lenient(args) if args.strip() else {}
+            if args is None:
+                args = {}
+            if not isinstance(args, dict):
+                return ToolParse(None, text, f"the arguments of {name!r} must be a JSON object")
+            calls.append({"id": f"call_{uuid.uuid4().hex[:24]}", "type": "function",
+                          "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}})
+    if not calls:
+        return ToolParse(None, text)
+    return ToolParse(calls, preamble)
 
 
 def parse_tool_calls(text: str, allowed: set[str]) -> list[dict] | None:
-    """Return OpenAI tool_calls if the WHOLE reply is a tool-call JSON object naming
-    only offered tools; otherwise None (the reply is treated as normal text)."""
-    if not allowed or not text:
-        return None
-    t = text.strip()
-    m = FENCE_RE.match(t)
-    if m:
-        t = m.group(1).strip()
-    if not t.startswith("{"):
-        return None
-    try:
-        obj, end = json.JSONDecoder().raw_decode(t)
-    except ValueError:
-        return None
-    if t[end:].strip() or not isinstance(obj, dict):
-        return None
-    if isinstance(obj.get("tool_calls"), list):
-        raw = obj["tool_calls"]
-    elif "tool" in obj:                       # compact format {"tool": ..., "args": {...}}
-        raw = [{"name": obj.get("tool"), "arguments": obj.get("args", obj.get("arguments", {}))}]
-    elif "name" in obj and ("arguments" in obj or "parameters" in obj):
-        raw = [{"name": obj["name"], "arguments": obj.get("arguments", obj.get("parameters", {}))}]
-    else:
-        return None
-    calls = []
-    for c in raw:
-        if not isinstance(c, dict):
-            return None
-        fn = c.get("function") if isinstance(c.get("function"), dict) else {}
-        name = c.get("name") or fn.get("name")
-        args = _args_obj(c.get("arguments", c.get("args", fn.get("arguments", {}))))
-        if args is None:
-            args = {}
-        if name not in allowed or not isinstance(args, dict):
-            return None
-        calls.append({"id": f"call_{uuid.uuid4().hex[:24]}", "type": "function",
-                      "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}})
-    return calls or None
+    """Return OpenAI tool_calls if the reply is a tool call naming only offered tools; else None."""
+    return parse_tool_reply(text, allowed).calls
+
+
+def tool_repair_message(error: str | None, required: bool) -> str:
+    why = (f"Your previous reply tried to call a tool, but it could not be used: {error}."
+           if error else "Your previous reply did not call a tool, but a tool call is required.")
+    return (why + " Reply again with ONLY the JSON object "
+            '{"tool_calls": [{"name": "<tool name>", "arguments": {...}}]} - valid JSON (escape '
+            "backslashes in paths), tool names exactly as listed, no other text.")
 
 
 JSON_INSTRUCTION = ("Respond with exactly one valid JSON object and nothing else: no markdown code fences, "
@@ -935,6 +1150,209 @@ def _check_len(name: str, v: Any, lo: int, hi: int) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# MCP endpoint (optional): u:ai models as tools for AI agents
+# --------------------------------------------------------------------------- #
+MCP_INSTRUCTIONS = (
+    "Tools backed by the u:ai API of the University of Vienna (Academic AI platform). 'ask' gets an answer "
+    "from another language model (e.g. for a second opinion), 'web_research' answers with web sources "
+    "(Perplexity sonar models), 'list_models' shows the available models and prices, 'usage' the estimated "
+    "cost of the month. Every ask/web_research call is billed to the bridge operator's u:ai account: call "
+    "them deliberately, not in loops, and send all needed context in one prompt (the models see no history)."
+)
+
+
+mt: Any = None       # mcp_types, bound by mount_mcp()
+Context: Any = None  # mcp.server.mcpserver.Context, bound by mount_mcp()
+
+
+class _McpGuard:
+    """ASGI wrapper in front of the MCP transport: Origin check, bridge authentication, body limit.
+
+    The resolved u:ai credentials travel to the tools in scope['state'], so static, trusted-CIDR and
+    passthrough mode work exactly as on the REST endpoints.
+    """
+
+    def __init__(self, app: Any, settings: Settings, authenticate: Any):
+        self.app, self.s, self.authenticate = app, settings, authenticate
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        request = Request(scope)
+        origin = (request.headers.get("origin") or "").rstrip("/")
+        try:
+            # DNS-rebinding protection (MCP spec): browsers send Origin, native clients do not.
+            if origin and origin not in self.s.mcp_allowed_origins:
+                raise BridgeError(403, "Origin not allowed for /mcp (see BRIDGE_MCP_ALLOWED_ORIGINS).",
+                                  "forbidden")
+            creds = self.authenticate(request)
+        except BridgeError as e:
+            await e.response()(scope, receive, send)
+            return
+        scope.setdefault("state", {})["uai_creds"] = creds
+        await self.app(scope, receive, send)
+
+
+def mount_mcp(app: FastAPI, s: Settings, *, authenticate: Any, run_chat: Any, fetch_models: Any,
+              price_sheet: Any, usage: UsageTracker | None) -> None:
+    """Add a Streamable HTTP MCP endpoint at /mcp (stateless, JSON responses).
+
+    Uses the official MCP Python SDK, which serves the stateless 2026-07-28 protocol and the older
+    handshake-based revisions on the same endpoint.
+    """
+    # Imported only here: the SDK takes seconds to import and is not needed without MCP. The tool
+    # signatures below are resolved against module globals (postponed annotations), hence `global`.
+    global mt, Context
+    try:
+        import mcp_types as mt
+        from mcp.server.mcpserver import Context, MCPServer
+        from mcp.server.mcpserver.exceptions import ToolError
+        from mcp.server.transport_security import TransportSecuritySettings
+        from starlette.routing import Route
+    except ImportError as e:  # pragma: no cover - depends on the installation
+        raise RuntimeError("BRIDGE_ENABLE_MCP=true needs the 'mcp' package (pip install -r requirements.txt).") from e
+
+    budget = DailyCallBudget(s.mcp_max_calls_per_day, s.usage_tz)
+    server = MCPServer(name="uai-bridge", title="u:ai bridge", version=__version__, instructions=MCP_INSTRUCTIONS)
+    ro = mt.ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False)
+    billed = mt.ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=False, openWorldHint=True)
+
+    def creds_of(ctx: Any) -> Creds:
+        creds = ctx.request_context.request.scope.get("state", {}).get("uai_creds")
+        if not creds:  # only reachable if the guard was bypassed
+            raise ToolError("Not authenticated.")
+        return creds
+
+    def spend(creds: Creds) -> None:
+        if not budget.take(creds[0]):
+            raise ToolError(f"Daily limit of {s.mcp_max_calls_per_day} ask/web_research calls reached for this "
+                            f"u:ai client (BRIDGE_MCP_MAX_CALLS_PER_DAY); it resets at midnight {s.usage_tz}.")
+
+    async def token_limit(creds: Creds, model: str, requested: int | None) -> int | None:
+        if requested is not None and not 1 <= requested <= s.mcp_max_tokens:
+            raise ToolError(f"max_tokens must be between 1 and {s.mcp_max_tokens} (BRIDGE_MCP_MAX_TOKENS).")
+        n = requested or s.mcp_max_tokens
+        try:  # never ask for more than the model can produce
+            info = next((m for m in await fetch_models(creds)
+                         if str(m.get("modelName", "")).lower() == model.lower()), None)
+        except BridgeError:
+            info = None
+        limit = (info or {}).get("outputTokenLimit")
+        return min(n, int(limit)) if isinstance(limit, int) and limit > 0 else n
+
+    async def complete(creds: Creds, model_in: str | None, messages: list, max_tokens: int | None,
+                       temperature: float | None = None, reasoning_effort: str | None = None) -> Any:
+        try:
+            model, _ = resolve_model(model_in, s)
+            params = translate_params(model, temperature=temperature,
+                                      max_tokens=await token_limit(creds, model, max_tokens),
+                                      reasoning_effort=reasoning_effort)
+        except BridgeError as e:
+            raise ToolError(e.message) from None
+        spend(creds)
+        try:
+            r = await run_chat(creds, model_in, messages, params)
+        except BridgeError as e:
+            raise ToolError(f"u:ai error ({e.status}): {e.message}") from None
+        text = r["content"] or "(empty answer)"
+        if r["finish"] == "length":
+            text += "\n\n[The answer was cut off at max_tokens.]"
+        data = {"model": r["model"], "answer": r["content"], "finish_reason": r["finish"], "usage": r["usage"],
+                "citations": r["citations"]}
+        if r["adjusted"]:
+            data["adjusted"] = r["adjusted"]
+        return mt.CallToolResult(content=[mt.TextContent(type="text", text=text)], structured_content=data)
+
+    def structured(data: dict) -> Any:
+        return mt.CallToolResult(content=[mt.TextContent(type="text", text=json.dumps(data, indent=1))],
+                                 structured_content=data)
+
+    def check_text(name: str, v: str | None, required: bool = True) -> str | None:
+        if v is None or not v.strip():
+            if required:
+                raise ToolError(f"'{name}' must not be empty.")
+            return None
+        if len(v.encode()) > s.max_request_bytes:
+            raise ToolError(f"'{name}' is larger than BRIDGE_MAX_REQUEST_MB.")
+        return v
+
+    @server.tool(annotations=billed, description=(
+        "Ask a u:ai language model and return its answer, e.g. for a second opinion or a review. The model "
+        "sees only this prompt (and the optional system text), so include all context. Use list_models for "
+        "model names; 'tailored:<id>' addresses a Tailored AI with its knowledge base. Billed per call."))
+    async def ask(
+        prompt: Annotated[str, Field(description="The complete question or task, with all needed context.")],
+        ctx: Context,
+        model: Annotated[str | None, Field(description="u:ai model name, e.g. gpt-5 or a name from "
+                                                       "list_models; default: the bridge default model.")] = None,
+        system: Annotated[str | None, Field(description="Optional instructions for the model.")] = None,
+        max_tokens: Annotated[int | None, Field(description="Upper bound for the answer length in tokens.")] = None,
+        temperature: Annotated[float | None, Field(description="0-2; some models ignore it.")] = None,
+        reasoning_effort: Annotated[Literal["low", "medium", "high"] | None,
+                                    Field(description="For reasoning models (o-series, gpt-5).")] = None,
+    ) -> mt.CallToolResult:
+        creds = creds_of(ctx)
+        messages = ([{"role": "system", "content": check_text("system", system, False)}] if system else [])
+        messages.append({"role": "user", "content": check_text("prompt", prompt)})
+        return await complete(creds, model, messages, max_tokens, temperature, reasoning_effort)
+
+    @server.tool(annotations=billed, description=(
+        "Research a question on the web with a Perplexity sonar model on u:ai and return the answer with "
+        "its web sources (citations with URLs). sonar-pro is fast; sonar-deep-research is thorough but slow "
+        "and more expensive. Billed per call."))
+    async def web_research(
+        query: Annotated[str, Field(description="The research question, with enough context.")],
+        ctx: Context,
+        model: Annotated[str | None, Field(description="A sonar-* model, e.g. sonar-pro or "
+                                                       "sonar-deep-research; default: the bridge setting.")] = None,
+        max_tokens: Annotated[int | None, Field(description="Upper bound for the answer length in tokens.")] = None,
+    ) -> mt.CallToolResult:
+        creds = creds_of(ctx)
+        m = (model or s.mcp_research_model).strip()
+        if not m.rsplit("/", 1)[-1].lower().startswith("sonar"):
+            raise ToolError("web_research needs a sonar-* model; use 'ask' for other models.")
+        return await complete(creds, m, [{"role": "user", "content": check_text("query", query)}], max_tokens)
+
+    @server.tool(annotations=ro, description=(
+        "List the u:ai models available to this account with context window, output limit and prices "
+        "(USD per 1M tokens, plus a per-request fee for web-search models). Free."))
+    async def list_models(ctx: Context) -> mt.CallToolResult:
+        creds = creds_of(ctx)
+        try:
+            sheet = await price_sheet(creds)
+        except BridgeError as e:
+            raise ToolError(f"u:ai error ({e.status}): {e.message}") from None
+        return structured({"currency": "USD", "default_model": s.default_model,
+                           "research_model": s.mcp_research_model,
+                           "models": [{"name": k, **v} for k, v in sorted(sheet.items()) if k]})
+
+    if usage is not None:
+        @server.tool(name="usage", annotations=ro, description=(
+            "Requests, tokens and estimated USD cost of this u:ai account for a month (default: the "
+            "current month, with a linear projection), plus today's MCP calls and the daily cap. Free."))
+        async def usage_report(
+            ctx: Context,
+            month: Annotated[str | None, Field(description="YYYY-MM; default: the current month.")] = None,
+        ) -> mt.CallToolResult:
+            creds = creds_of(ctx)
+            if month is not None and not MONTH_RE.match(month):
+                raise ToolError("'month' must look like YYYY-MM.")
+            rep = usage.report(creds[0], month)
+            rep["mcp_calls_today"] = budget.used(creds[0])
+            rep["mcp_daily_limit"] = s.mcp_max_calls_per_day or None
+            return structured(rep)
+
+    starlette_app = server.streamable_http_app(
+        streamable_http_path="/mcp", stateless_http=True, json_response=True,
+        max_request_body_size=s.max_request_bytes,
+        # Host/Origin are checked by _McpGuard; the SDK's Host allow-list would break LAN and proxy setups.
+        transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False))
+    endpoint = starlette_app.routes[0].endpoint
+    app.router.routes.append(Route("/mcp", endpoint=_McpGuard(endpoint, s, authenticate),
+                                   methods=["GET", "POST", "DELETE"]))
+    app.state.mcp_session_manager = server.session_manager
+    app.state.mcp_budget = budget
+
+
+# --------------------------------------------------------------------------- #
 # Application
 # --------------------------------------------------------------------------- #
 def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTransport | None = None) -> FastAPI:
@@ -951,7 +1369,13 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
         if usage is not None:
             log.info("usage counter: %s (month time zone %s)",
                      usage.path if usage.persistent else "in memory only (resets on restart)", s.usage_tz)
-        yield
+        async with AsyncExitStack() as stack:
+            mgr = getattr(_app.state, "mcp_session_manager", None)
+            if mgr is not None:
+                await stack.enter_async_context(mgr.run())
+                log.info("MCP endpoint enabled at /mcp (cap %s calls/day per u:ai client)",
+                         s.mcp_max_calls_per_day or "no")
+            yield
         await uai.close()
 
     app = FastAPI(title="u:ai bridge", version=__version__, lifespan=lifespan,
@@ -1037,8 +1461,9 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
         want_json = s.enforce_json and (params.get("responseFormat") or {}).get("type") == "json_object"
         if want_json and not allowed:
             instruction = JSON_INSTRUCTION
-        payload: dict[str, Any] = {"model": model,
-                                   "messages": to_uai_messages(messages, s.image_mode, instruction)}
+        required = bool(allowed) and (tool_choice == "required" or isinstance(tool_choice, dict))
+        conv = to_uai_messages(messages, s.image_mode, instruction, TOOL_REMINDER if allowed else "")
+        payload: dict[str, Any] = {"model": model, "messages": conv}
         if tailored_id:
             payload["tailoredAiId"] = tailored_id
         payload.update(params)
@@ -1047,36 +1472,61 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
             if 0 < payload.get("maxTokens", s.gemini_min_max_tokens) < s.gemini_min_max_tokens:
                 payload["maxTokens"] = s.gemini_min_max_tokens
                 adjusted.append(f"maxTokens->{s.gemini_min_max_tokens}")
-        try:
-            res = await uai.request("POST", "/api/v1/llm/chat", creds, json_body=payload)
-        except BridgeError as e:
-            # Some models reject individual parameters (e.g. claude-opus-4-6: 'temperature'). A rejected
-            # request was not processed, so retrying once without that field is safe.
-            f = getattr(e, "rejected_field", None)
-            if e.status == 400 and f and f in payload and f not in ("model", "messages", "tailoredAiId"):
-                payload.pop(f)
-                adjusted.append(f"dropped:{f}")
-                log.info("u:ai rejected field %r for model %s; retrying without it", f, model)
+
+        async def post() -> tuple[dict, str, dict]:
+            try:
                 res = await uai.request("POST", "/api/v1/llm/chat", creds, json_body=payload)
-            else:
-                raise
-        d = res.get("data") or {}
-        # Plain chat returns data.content; Tailored-AI (RAG) chat returns data.message.content and no
-        # usage/finishReason (observed live, differs from the API docs v1.0.7).
-        msg = d.get("message") if isinstance(d.get("message"), dict) else {}
-        content = (d.get("content") or msg.get("content") or "").strip()
-        tool_calls = parse_tool_calls(content, allowed)
+            except BridgeError as e:
+                # Some models reject individual parameters (e.g. claude-opus-4-6: 'temperature'). A rejected
+                # request was not processed, so retrying once without that field is safe.
+                f = getattr(e, "rejected_field", None)
+                if e.status == 400 and f and f in payload and f not in ("model", "messages", "tailoredAiId"):
+                    payload.pop(f)
+                    adjusted.append(f"dropped:{f}")
+                    log.info("u:ai rejected field %r for model %s; retrying without it", f, model)
+                    res = await uai.request("POST", "/api/v1/llm/chat", creds, json_body=payload)
+                else:
+                    raise
+            d = res.get("data") or {}
+            # Plain chat returns data.content; Tailored-AI (RAG) chat returns data.message.content and no
+            # usage/finishReason (observed live, differs from the API docs v1.0.7).
+            msg = d.get("message") if isinstance(d.get("message"), dict) else {}
+            u = _usage(d)
+            if usage is not None:
+                usage.record(creds[0], model, u, await estimate_cost(creds, model, u))
+            return d, (d.get("content") or msg.get("content") or "").strip(), u
+
+        d, content, u = await post()
+        tp = parse_tool_reply(content, allowed)
+        tool_status = "none" if not allowed else ("parsed" if tp.calls else ("failed" if tp.error else "text"))
+        for _ in range(s.tool_repair_retries):
+            # The model tried to call a tool but the call is unusable (invalid JSON, unknown tool, ...), or a
+            # required call is missing. Re-asking is a new, deliberate request - it is billed like any other.
+            if tp.calls or not (tp.error or required):
+                break
+            log.info("emulated tool call unusable for model %s (%s); asking for a corrected call",
+                     model, "required call missing" if not tp.error else tp.error.split(";")[0][:80])
+            payload["messages"] = conv + [{"role": "assistant", "content": content or "(empty reply)"},
+                                          {"role": "user", "content": "### SYSTEM INSTRUCTION ###\n"
+                                           + tool_repair_message(tp.error, required)}]
+            d, content2, u2 = await post()
+            u = {k: u.get(k, 0) + u2.get(k, 0) for k in set(u) | set(u2)}
+            tp2 = parse_tool_reply(content2, allowed)
+            if tp2.calls:
+                tp, content, tool_status = tp2, content2, "repaired"
+            elif not tp.error:          # required call still missing: return the newer answer
+                tp, content = tp2, content2
+        tool_calls = tp.calls
+        if tool_calls:
+            content = tp.content       # a short preamble before the call, if any
         if want_json and not tool_calls:
             content = extract_json_object(content) or content
-        u = _usage(d)
-        if usage is not None:
-            usage.record(creds[0], model, u, await estimate_cost(creds, model, u))
         cit_text, citations = format_citations(d.get("citations"))
         if cit_text and s.append_citations and not tool_calls and not want_json:
             content += cit_text
         return {"model": model, "content": content, "tool_calls": tool_calls, "citations": citations,
                 "finish": "tool_calls" if tool_calls else _finish(d.get("finishReason")), "usage": u,
-                "adjusted": adjusted}
+                "adjusted": adjusted, "tool_status": tool_status}
 
     # ---- health ------------------------------------------------------------
     @app.get("/health")
@@ -1101,10 +1551,7 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
                for m in await fetch_models(creds) if m.get("modelName")]
         return {"object": "list", "data": out}
 
-    @app.get("/v1/pricing")
-    async def pricing(request: Request):
-        creds = authenticate(request)
-
+    async def price_sheet(creds: Creds) -> dict:
         factor = 1_000_000 / s.cost_unit_tokens
 
         def per_m(v):  # u:ai reports USD per BRIDGE_COST_UNIT_TOKENS tokens (1 000, observed live)
@@ -1120,7 +1567,12 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
                 "output_usd_per_1m_tokens": per_m(costs.get("output_tokens")),
                 "usd_per_request": costs.get("per_request"),
             }
-        return {"currency": "USD", "unit": "per 1M tokens", "models": sheet}
+        return sheet
+
+    @app.get("/v1/pricing")
+    async def pricing(request: Request):
+        creds = authenticate(request)
+        return {"currency": "USD", "unit": "per 1M tokens", "models": await price_sheet(creds)}
 
     # ---- monthly usage counter ---------------------------------------------
     async def estimate_cost(creds: Creds, model: str, u: dict) -> float | None:
@@ -1192,12 +1644,15 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
                            body.get("tool_choice", body.get("function_call")))
         cid, created = f"chatcmpl-{uuid.uuid4().hex[:24]}", int(time.time())
         label = body.get("model") or r["model"]
-        message: dict[str, Any] = {"role": "assistant", "content": None if r["tool_calls"] else r["content"]}
+        message: dict[str, Any] = {"role": "assistant",
+                                   "content": (r["content"] or None) if r["tool_calls"] else r["content"]}
         if r["tool_calls"]:
             message["tool_calls"] = r["tool_calls"]
         headers = {"X-Bridge-Ignored-Params": ",".join(ignored)[:500]} if ignored else {}
         if r["adjusted"]:
             headers["X-Bridge-Adjusted-Params"] = ",".join(r["adjusted"])[:500]
+        if r["tool_status"] != "none":
+            headers["X-Bridge-Tool-Calls"] = r["tool_status"]
 
         if body.get("stream"):
             include_usage = bool((body.get("stream_options") or {}).get("include_usage"))
@@ -1210,6 +1665,8 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
                 # u:ai cannot stream; the complete answer is sent as one content chunk.
                 yield _sse(chunk({"role": "assistant", "content": ""}))
                 if r["tool_calls"]:
+                    if r["content"]:
+                        yield _sse(chunk({"content": r["content"]}))
                     yield _sse(chunk({"tool_calls": [dict(tc, index=i) for i, tc in enumerate(r["tool_calls"])]}))
                 elif r["content"]:
                     yield _sse(chunk({"content": r["content"]}))
@@ -1263,7 +1720,7 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
             messages = [{"role": "user", "content": body["prompt"]}]
         r = await run_chat(creds, body.get("model"), messages, params, body.get("tools"), None)
         label = body.get("model") or r["model"]
-        msg: dict[str, Any] = {"role": "assistant", "content": "" if r["tool_calls"] else r["content"]}
+        msg: dict[str, Any] = {"role": "assistant", "content": r["content"] or ""}
         if r["tool_calls"]:
             msg["tool_calls"] = [{"function": {"name": tc["function"]["name"],
                                                "arguments": json.loads(tc["function"]["arguments"])}}
@@ -1452,6 +1909,11 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
             raise
         return {"status": "ready", "tailored_ai_id": tai_id, "knowledge_base_id": kb_id,
                 "documents": uploaded, "model": f"tailored:{tai_id}"}
+
+    # ---- MCP endpoint (opt-in) ----------------------------------------------
+    if s.enable_mcp:
+        mount_mcp(app, s, authenticate=authenticate, run_chat=run_chat, fetch_models=fetch_models,
+                  price_sheet=price_sheet, usage=usage)
 
     return app
 

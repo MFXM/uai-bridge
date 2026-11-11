@@ -13,6 +13,8 @@ Include the version (`GET /health`), your configuration (without secrets) and st
 - u:ai credentials are only sent to `UAI_BASE_URL` over HTTPS, as request headers.
 - Prompts, answers and uploaded documents are never logged.
 - Upstream requests that may already have been processed (read timeouts) are never retried.
+- The optional MCP endpoint is off by default, uses the same authentication, rejects unlisted browser
+  origins, caps billed tool calls per day and offers no tools that touch files, knowledge bases or settings.
 
 ## If a secret may have leaked
 Ask for a new u:ai client secret (an API client can have two secrets for zero-downtime rotation),

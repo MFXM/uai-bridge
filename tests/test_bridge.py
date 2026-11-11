@@ -178,7 +178,7 @@ def test_roles_are_translated_and_merged():
     assert [m["role"] for m in sent] == ["user", "assistant", "user"]
     assert sent[0]["content"].startswith("### SYSTEM INSTRUCTION ###\nBe brief.") and "Q1" in sent[0]["content"]
     assert json.loads(sent[1]["content"]) == {"tool_calls": [{"name": "f", "arguments": {"a": 1}}]}
-    assert "### TOOL RESULT [1] ###\n42" in sent[2]["content"] and sent[2]["content"].endswith("Q2")
+    assert "### TOOL RESULT [f | 1] ###\n42" in sent[2]["content"] and sent[2]["content"].endswith("Q2")
 
 
 def test_empty_messages_rejected_without_upstream_call():
@@ -274,6 +274,108 @@ def test_tool_choice_none_disables_emulation():
     r = chat(c, tools=TOOLS, tool_choice="none").json()
     assert r["choices"][0]["finish_reason"] == "stop"
     assert "Available tools" not in up.chat_payloads()[0]["messages"][0]["content"]
+
+
+A = {"grep", "glob", "read"}
+WIN = r"C:\Users\me\Documents\Universität\Vault"
+
+
+def test_parse_windows_path_with_single_backslashes():
+    raw = '{"tool_calls": [{"name": "grep", "arguments": {"pattern": "MBQC", "path": "' + WIN + '"}}]}'
+    calls = b.parse_tool_calls(raw, A)
+    assert calls and json.loads(calls[0]["function"]["arguments"])["path"] == WIN
+
+
+def test_parse_preamble_is_kept_as_content():
+    tp = b.parse_tool_reply('I will search the vault first.\n{"tool_calls": [{"name": "grep", '
+                            '"arguments": {"pattern": "x"}}]}', A)
+    assert tp.calls and tp.content == "I will search the vault first."
+    tp = b.parse_tool_reply('Searching.\n```json\n{"tool_calls": [{"name": "grep", "arguments": {}}]}\n```', A)
+    assert tp.calls and tp.content == "Searching."
+
+
+def test_parse_prefixed_names_several_objects_and_string_args():
+    t = ('{"tool_calls": [{"name": "functions.grep", "arguments": "{\\"pattern\\": \\"a\\"}"}]}\n'
+         '{"tool_calls": [{"name": "Glob", "arguments": {"pattern": "*.md"}}]}')
+    calls = b.parse_tool_calls(t, A)
+    assert [c["function"]["name"] for c in calls] == ["grep", "glob"]
+    assert json.loads(calls[0]["function"]["arguments"]) == {"pattern": "a"}
+    one = b.parse_tool_calls('{"function": {"name": "read", "arguments": {"filePath": "a"}}}', A)
+    assert one[0]["function"]["name"] == "read"
+
+
+def test_parse_cuts_invented_tool_result():
+    t = '{"tool_calls": [{"name": "grep", "arguments": {"pattern": "x"}}]}\n### TOOL RESULT [grep] ###\n3 files'
+    tp = b.parse_tool_reply(t, A)
+    assert tp.calls and tp.content == ""
+
+
+def test_parse_reports_unusable_attempts_but_not_prose():
+    assert "unknown tool" in b.parse_tool_reply('{"tool_calls": [{"name": "rm_rf", "arguments": {}}]}', A).error
+    assert b.parse_tool_reply('{"tool_calls": [{"name": "grep", "arguments": {"pattern": ', A).error
+    assert b.parse_tool_reply('{"tool_calls": [{"name": "grep", "arguments": [1]}]}', A).error
+    plain = b.parse_tool_reply('Use {"tool_calls": [{"name": "grep", "arguments": {}}]} like this.', A)
+    assert plain.calls is None and plain.error is None
+    assert b.parse_tool_reply("The set {a, b} is finite.", A).error is None
+
+
+def test_tool_instruction_after_client_system_prompt_and_reminder_at_end():
+    c, up = make()
+    msgs = [{"role": "system", "content": "You are an agent with native tools."},
+            {"role": "user", "content": "find MBQC"},
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "search", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "nothing"}]
+    up.chat_reply = dict(up.chat_reply, content="No hits.")
+    chat(c, messages=msgs, tools=TOOLS)
+    sent = up.chat_payloads()[0]["messages"]
+    first = sent[0]["content"]
+    assert first.index("native tools") < first.index("TOOL PROTOCOL") < first.index("find MBQC")
+    assert "### TOOL RESULT [search | c1] ###" in sent[-1]["content"]
+    assert sent[-1]["content"].rstrip().endswith(b.TOOL_REMINDER)
+
+
+def test_unusable_tool_call_is_repaired_once():
+    c, up = make()
+    bad = {"data": dict(up.chat_reply, content='{"tool_calls": [{"name": "serch", "arguments": {}}]}')}
+    good = {"data": dict(up.chat_reply, content='{"tool_calls": [{"name": "search", "arguments": {"q": "a"}}]}')}
+    up.queue["/api/v1/llm/chat"] = [httpx.Response(200, json=bad), httpx.Response(200, json=good)]
+    r = chat(c, tools=TOOLS)
+    assert r.headers["X-Bridge-Tool-Calls"] == "repaired"
+    assert r.json()["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "search"
+    assert r.json()["usage"]["total_tokens"] == 10
+    second = up.chat_payloads()[1]["messages"]
+    assert second[-2]["role"] == "assistant" and "unknown tool 'serch'" in second[-1]["content"]
+
+
+def test_no_repair_for_plain_answers_or_when_disabled():
+    c, up = make()
+    up.chat_reply = dict(up.chat_reply, content="Plain answer.")
+    r = chat(c, tools=TOOLS)
+    assert r.headers["X-Bridge-Tool-Calls"] == "text" and len(up.chat_payloads()) == 1
+    c, up = make(tool_repair_retries=0)
+    up.chat_reply = dict(up.chat_reply, content='{"tool_calls": [{"name": "serch", "arguments": {}}]}')
+    r = chat(c, tools=TOOLS)
+    assert r.headers["X-Bridge-Tool-Calls"] == "failed" and len(up.chat_payloads()) == 1
+
+
+def test_required_tool_call_is_requested_again():
+    c, up = make()
+    txt = {"data": dict(up.chat_reply, content="I think the answer is 42.")}
+    good = {"data": dict(up.chat_reply, content='{"tool_calls": [{"name": "calc", "arguments": {}}]}')}
+    up.queue["/api/v1/llm/chat"] = [httpx.Response(200, json=txt), httpx.Response(200, json=good)]
+    r = chat(c, tools=TOOLS, tool_choice="required")
+    assert r.json()["choices"][0]["finish_reason"] == "tool_calls"
+
+
+def test_stream_sends_preamble_then_tool_calls():
+    c, up = make()
+    up.chat_reply = dict(up.chat_reply, content='Searching.\n{"tool_calls": [{"name": "search", "arguments": {}}]}')
+    r = chat(c, tools=TOOLS, stream=True)
+    events = [json.loads(l[6:]) for l in r.text.splitlines() if l.startswith("data: {")]
+    deltas = [e["choices"][0]["delta"] for e in events if e["choices"]]
+    assert deltas[1] == {"content": "Searching."} and "tool_calls" in deltas[2]
+    assert events[-1]["choices"][0]["finish_reason"] == "tool_calls"
 
 
 # ---------------------------------------------------------------- errors & retries
@@ -607,3 +709,177 @@ def test_usage_can_be_disabled():
     c, _ = make(usage_tracking=False)
     assert chat(c).status_code == 200
     assert c.get("/v1/usage", headers=AUTH).status_code == 404
+
+
+# ---------------------------------------------------------------- MCP endpoint
+MCP_H = {**AUTH, "Accept": "application/json, text/event-stream", "Content-Type": "application/json"}
+MODERN = "2026-07-28"
+META = {"io.modelcontextprotocol/protocolVersion": MODERN,
+        "io.modelcontextprotocol/clientInfo": {"name": "pytest", "version": "1"},
+        "io.modelcontextprotocol/clientCapabilities": {}}
+
+
+def mcp_make(**overrides):
+    overrides.setdefault("enable_mcp", True)
+    return make(**overrides)
+
+
+def rpc(client, method, params=None, name=None, headers=None, version=MODERN):
+    """One JSON-RPC request in the stateless 2026-07-28 shape (or an older one with version=...)."""
+    h = {**MCP_H, "MCP-Protocol-Version": version, **(headers or {})}
+    params = dict(params or {})
+    if version == MODERN:
+        h["Mcp-Method"] = method
+        if name:
+            h["Mcp-Name"] = name
+        params["_meta"] = META
+    return client.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params}, headers=h)
+
+
+def call_tool(client, name, args=None, **kw):
+    r = rpc(client, "tools/call", {"name": name, "arguments": args or {}}, name=name, **kw)
+    assert r.status_code == 200, r.text
+    return r.json()["result"]
+
+
+def test_mcp_disabled_by_default():
+    client, _ = make()
+    with client:
+        assert client.post("/mcp", json={}, headers=MCP_H).status_code == 404
+
+
+def test_mcp_needs_bridge_key_and_checks_origin():
+    client, up = mcp_make(mcp_allowed_origins=("https://chat.example.org",))
+    with client:
+        assert rpc(client, "tools/list", headers={"Authorization": ""}).status_code == 401
+        assert rpc(client, "tools/list", headers={"Authorization": "Bearer wrong-key-wrong-key-wrong"}).status_code == 401
+        assert rpc(client, "tools/list", headers={"Origin": "https://evil.example"}).status_code == 403
+        assert rpc(client, "tools/list", headers={"Origin": "https://chat.example.org"}).status_code == 200
+        assert rpc(client, "tools/list").status_code == 200          # native clients send no Origin
+    assert up.calls == []
+
+
+def test_mcp_lists_tools_for_new_and_handshake_protocols():
+    client, _ = mcp_make()
+    with client:
+        names = {t["name"] for t in rpc(client, "tools/list").json()["result"]["tools"]}
+        assert names == {"ask", "web_research", "list_models", "usage"}
+        old = "2025-06-18"
+        init = rpc(client, "initialize", {"protocolVersion": old, "capabilities": {},
+                                          "clientInfo": {"name": "pytest", "version": "1"}}, version=old)
+        assert init.json()["result"]["serverInfo"]["version"] == b.__version__
+        tools = rpc(client, "tools/list", version=old).json()["result"]["tools"]
+        ask = next(t for t in tools if t["name"] == "ask")
+        assert ask["inputSchema"]["required"] == ["prompt"]
+        assert ask["annotations"]["readOnlyHint"] is True and ask["annotations"]["idempotentHint"] is False
+
+
+def test_mcp_usage_tool_absent_without_tracking():
+    client, _ = mcp_make(usage_tracking=False)
+    with client:
+        names = {t["name"] for t in rpc(client, "tools/list").json()["result"]["tools"]}
+        assert "usage" not in names
+
+
+def test_mcp_ask_roundtrip_counts_usage():
+    client, up = mcp_make()
+    with client:
+        res = call_tool(client, "ask", {"prompt": "Is 2+2=4?", "system": "Be brief.", "temperature": 0})
+        assert res["isError"] is False
+        assert res["content"][0]["text"] == "Hello!"
+        assert res["structuredContent"]["usage"]["total_tokens"] == 5
+        p = up.chat_payloads()[-1]
+        assert p["model"] == "gpt-4o" and p["temperature"] == 0
+        assert p["messages"][0]["content"].startswith("### SYSTEM INSTRUCTION ###")
+        assert p["maxTokens"] == 16000                      # BRIDGE_MCP_MAX_TOKENS default
+        rep = call_tool(client, "usage")["structuredContent"]
+        assert rep["requests"] == 1 and rep["mcp_calls_today"] == 1 and rep["mcp_daily_limit"] == 1000
+
+
+def test_mcp_max_tokens_capped_by_setting_and_model_limit():
+    client, up = mcp_make(mcp_max_tokens=50000)
+    with client:
+        call_tool(client, "ask", {"prompt": "x"})
+        assert up.chat_payloads()[-1]["maxTokens"] == 16384  # gpt-4o outputTokenLimit in the fake
+        n = len(up.chat_payloads())
+        res = call_tool(client, "ask", {"prompt": "x", "max_tokens": 60000})
+        assert res["isError"] is True and "BRIDGE_MCP_MAX_TOKENS" in res["content"][0]["text"]
+        assert len(up.chat_payloads()) == n                 # rejected before any upstream call
+
+
+def test_mcp_reasoning_model_uses_max_completion_tokens():
+    client, up = mcp_make()
+    with client:
+        call_tool(client, "ask", {"prompt": "x", "model": "gpt-5", "reasoning_effort": "high", "max_tokens": 900})
+        p = up.chat_payloads()[-1]
+        assert p["maxCompletionTokens"] == 900 and p["reasoningEffort"] == "high" and "maxTokens" not in p
+
+
+def test_mcp_web_research_returns_citations_and_needs_sonar():
+    client, up = mcp_make()
+    up.chat_reply = dict(up.chat_reply, content="Answer [1].", citations=[
+        {"index": 1, "type": "website", "location": {"documentName": "Example"}, "pageContent": "https://example.org/a"}])
+    with client:
+        res = call_tool(client, "web_research", {"query": "What is new?"})
+        assert res["isError"] is False
+        assert up.chat_payloads()[-1]["model"] == "sonar-pro"
+        assert up.chat_payloads()[-1]["maxTokens"] == 8000  # sonar-pro outputTokenLimit in the fake
+        assert res["structuredContent"]["citations"][0]["url"] == "https://example.org/a"
+        assert "https://example.org/a" in res["content"][0]["text"]
+        n = len(up.chat_payloads())
+        bad = call_tool(client, "web_research", {"query": "x", "model": "gpt-4o"})
+        assert bad["isError"] is True and len(up.chat_payloads()) == n
+
+
+def test_mcp_daily_cap_blocks_without_upstream_call():
+    client, up = mcp_make(mcp_max_calls_per_day=2)
+    with client:
+        assert call_tool(client, "ask", {"prompt": "1"})["isError"] is False
+        assert call_tool(client, "web_research", {"query": "2"})["isError"] is False
+        third = call_tool(client, "ask", {"prompt": "3"})
+        assert third["isError"] is True and "Daily limit of 2" in third["content"][0]["text"]
+        assert len(up.chat_payloads()) == 2
+        assert call_tool(client, "list_models")["isError"] is False   # free tools are not capped
+
+
+def test_daily_call_budget_resets_per_day_and_account():
+    from datetime import datetime, timezone
+    bud = b.DailyCallBudget(1, "UTC")
+    d1, d2 = datetime(2026, 11, 10, 12, tzinfo=timezone.utc), datetime(2026, 11, 11, 0, 1, tzinfo=timezone.utc)
+    assert bud.take("a", d1) and not bud.take("a", d1) and bud.take("b", d1)
+    assert bud.take("a", d2) and bud.used("a", d2) == 1
+    assert b.DailyCallBudget(0, "UTC").take("a", d1)                   # 0 = no cap
+
+
+def test_mcp_upstream_error_becomes_tool_error():
+    client, up = mcp_make(max_retries=0)
+    up.queue["/api/v1/llm/chat"] = [httpx.Response(400, json={"meta": {"error": {"message": "context too long"}}})]
+    with client:
+        res = call_tool(client, "ask", {"prompt": "x"})
+        assert res["isError"] is True and "context too long" in res["content"][0]["text"]
+
+
+def test_mcp_list_models_shows_prices():
+    client, _ = mcp_make()
+    with client:
+        data = call_tool(client, "list_models")["structuredContent"]
+        m = {x["name"]: x for x in data["models"]}
+        assert m["gpt-4o"]["input_usd_per_1m_tokens"] == 2.5 and m["sonar-pro"]["usd_per_request"] == 0.014
+
+
+def test_mcp_passthrough_uses_callers_credentials():
+    client, up = mcp_make(credential_mode="passthrough", client_id=None, client_secret=None, api_keys=())
+    with client:
+        h = {"Authorization": "Bearer my-id:my-secret"}
+        r = rpc(client, "tools/call", {"name": "ask", "arguments": {"prompt": "x"}}, name="ask", headers=h)
+        assert r.json()["result"]["isError"] is False
+        chat_call = [c for c in up.calls if c[1] == "/api/v1/llm/chat"][-1]
+        assert chat_call[3]["x-client-id"] == "my-id" and chat_call[3]["x-client-secret"] == "my-secret"
+
+
+def test_mcp_settings_are_validated():
+    base = dict(client_id="cid", client_secret="cs", api_keys=(KEY,))
+    for bad in (dict(mcp_max_calls_per_day=-1), dict(mcp_max_tokens=0), dict(mcp_research_model="bad model!"),
+                dict(mcp_allowed_origins=("example.org",))):
+        with pytest.raises(RuntimeError):
+            b.Settings(**base, **bad).validate()

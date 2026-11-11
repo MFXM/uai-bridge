@@ -2,6 +2,41 @@
 
 All notable changes are documented here. This project uses [Semantic Versioning](https://semver.org/).
 
+## 1.2.0 (2026-11-11)
+**Optional MCP endpoint for AI agents**
+- `BRIDGE_ENABLE_MCP=true` adds a Model Context Protocol server at `/mcp` (Streamable HTTP, stateless,
+  JSON responses) built on the official MCP Python SDK. It serves the stateless 2026-07-28 revision and the
+  older handshake-based revisions (2024-11-05 to 2025-11-25) on the same URL.
+- Tools: `ask` (any u:ai model or `tailored:<id>`, optional system text, `max_tokens`, `temperature`,
+  `reasoning_effort`), `web_research` (`sonar-*` models, answer plus web sources), `list_models` (with
+  prices) and `usage` (monthly estimate plus today's MCP calls). Results carry text and structured content;
+  upstream errors become tool errors.
+- Same authentication as the REST API (bridge key, trusted CIDRs, or `passthrough` credentials) and the
+  same upstream path: retry rules, rate limit, concurrency limit and usage counter all apply.
+- Guard rails: `BRIDGE_MCP_MAX_CALLS_PER_DAY` (default 1000 billed calls per u:ai client and day),
+  `BRIDGE_MCP_MAX_TOKENS` (default 16000, also capped at the model's output limit), and an `Origin` check
+  (`BRIDGE_MCP_ALLOWED_ORIGINS`) against DNS rebinding. `BRIDGE_MCP_RESEARCH_MODEL` sets the default
+  research model.
+- New dependency `mcp==2.3.0` (about 15 MB in the image), imported only when the endpoint is enabled.
+- `GET /v1/pricing` and the `list_models` tool share one price-sheet helper (no change in output).
+- 14 new unit tests; `live_check.py --mcp` checks the endpoint against the real API.
+
+**More reliable emulated tool calls** (agentic coding clients)
+- The parser now accepts the reply shapes models actually produce: a short sentence before the call
+  (returned as `content` next to `tool_calls`), several JSON objects, `functions.` name prefixes and
+  case differences, arguments given as a JSON string, and Windows paths written with single backslashes
+  (invalid JSON escapes are repaired). A `### TOOL RESULT` block the model invents after its call is cut off.
+  JSON shown as an example inside prose is still treated as text.
+- When a reply clearly tries to call a tool but the call is unusable (invalid JSON, unknown tool name,
+  non-object arguments), or a required call is missing, the bridge asks the model once more with the reason
+  (`BRIDGE_TOOL_REPAIR_RETRIES`, default 1, 0 disables). The extra request is billed and counted as usual.
+- The tool protocol is placed after the client's own system prompt and says that it overrides other
+  instructions about invoking tools; it covers JSON escaping, parallel calls and not guessing results.
+  A short reminder is appended to the last message of longer conversations.
+- Tool results are labelled with the tool name and call id (`### TOOL RESULT [grep | call_…] ###`).
+- Responses to requests with tools carry `X-Bridge-Tool-Calls: parsed | repaired | failed | text`.
+- 10 new unit tests (79 in total).
+
 ## 1.1.0 (2026-10-27)
 **Monthly usage counter**
 - `GET /v1/usage` (optionally `?month=YYYY-MM`) and `GET /v1/usage/history`: requests, prompt/completion/total
