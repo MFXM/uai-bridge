@@ -3,6 +3,6 @@ fastapi==0.156.4
 uvicorn==0.54.0
 httpx==0.28.1
 python-multipart==0.0.32
-tzdata==2026.5
+tzdata==2026.6
 # MCP endpoint (BRIDGE_ENABLE_MCP=true); imported only when enabled
 mcp==2.3.0
