@@ -329,6 +329,32 @@ def test_parse_cuts_invented_tool_result():
     assert tp.calls and tp.content == ""
 
 
+def test_parse_cuts_invented_result_on_the_same_line():
+    # Shape seen live in opencode: call JSON, then an invented result directly after "}]}", then an answer.
+    t = ('{"tool_calls":[{"name":"webfetch","arguments":{"url":"https://example.org/docs","format":"markdown"}},'
+         '{"name":"webfetch","arguments":{"url":"https://example.org/config"}}]}### TOOL RESULT [webfetch | '
+         'call_aPy9vDiFgxAzjABrwAPC3nTV]\nTitle: Docs\n```json\n{"$schema": "x"}\n```\nNeed more docs.The answer is ...')
+    tp = b.parse_tool_reply(t, {"webfetch"})
+    assert [c["function"]["name"] for c in tp.calls] == ["webfetch", "webfetch"] and tp.content == ""
+    tp = b.parse_tool_reply('Fetching.\n{"tool_calls":[{"name":"grep","arguments":{}}]}\nWaiting...\n'
+                            '### TOOL RESULT [grep]\n3 hits', A)
+    assert tp.calls and tp.content == "Fetching."
+
+
+def test_parse_leading_call_followed_by_an_early_answer():
+    t = '{"tool_calls":[{"name":"grep","arguments":{"pattern":"x"}}]}\nNeed more. The best way is ...'
+    tp = b.parse_tool_reply(t, A)
+    assert tp.calls and tp.content == ""
+    two = b.parse_tool_reply('{"tool_calls":[{"name":"grep","arguments":{}}]}\n'
+                             '{"tool_calls":[{"name":"glob","arguments":{}}]} so here it is', A)
+    assert [c["function"]["name"] for c in two.calls] == ["grep", "glob"]
+
+
+def test_instruction_no_longer_shows_a_result_template():
+    instr, _ = b.build_tool_instruction(TOOLS, "auto")
+    assert "<call id>" not in instr and "everything after the JSON is discarded" in instr
+
+
 def test_parse_reports_unusable_attempts_but_not_prose():
     assert "unknown tool" in b.parse_tool_reply('{"tool_calls": [{"name": "rm_rf", "arguments": {}}]}', A).error
     assert b.parse_tool_reply('{"tool_calls": [{"name": "grep", "arguments": {"pattern": ', A).error

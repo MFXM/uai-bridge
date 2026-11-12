@@ -45,7 +45,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-__version__ = "1.2.1"
+__version__ = "1.2.2"
 
 log = logging.getLogger("uai-bridge")
 
@@ -857,8 +857,9 @@ def build_tool_instruction(tools: Any, tool_choice: Any) -> tuple[str, set[str]]
         "- The JSON must be valid: escape backslashes and quotes inside strings, e.g. a Windows path is "
         '"C:\\\\Users\\\\name".',
         "- Independent calls go into the same tool_calls list; do not write several JSON objects.",
-        "- After the JSON, stop. Never write a tool result yourself and never guess it. Results are sent "
-        "back to you in messages that start with '### TOOL RESULT [<tool name> | <call id>]'.",
+        "- End your reply right after the JSON. The tools run outside this conversation, and their results "
+        "arrive in the next message. Never write a tool result yourself and never guess one: everything "
+        "after the JSON is discarded.",
         "- If you do not need a tool, answer normally in plain text and do not output JSON of that shape.",
         "Available tools:",
     ]
@@ -876,7 +877,7 @@ def build_tool_instruction(tools: Any, tool_choice: Any) -> tuple[str, set[str]]
 
 FENCE_RE = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.DOTALL | re.IGNORECASE)
 FENCE_LINE_RE = re.compile(r"^[ \t]*```[A-Za-z0-9_-]*[ \t]*$", re.MULTILINE)
-FAKE_RESULT_RE = re.compile(r"^[ \t]*#{2,}[ \t]*TOOL RESULT\b", re.MULTILINE | re.IGNORECASE)
+FAKE_RESULT_RE = re.compile(r"#{2,}[ \t]*TOOL RESULT\b", re.IGNORECASE)   # anywhere, also mid-line
 BAD_ESCAPE_RE = re.compile(r'\\(?!["\\/bfnrt]|u[0-9a-fA-F]{4})')
 NAME_PREFIX_RE = re.compile(r"^(?:functions|function|tools|tool)[.:]", re.IGNORECASE)
 
@@ -959,19 +960,9 @@ def _resolve_tool_name(name: Any, allowed: set[str]) -> str | None:
     return low[0] if len(low) == 1 else None
 
 
-def parse_tool_reply(text: str, allowed: set[str]) -> ToolParse:
-    """Find emulated tool calls in a model reply.
-
-    Accepted: the reply is a tool-call JSON object, optionally fenced, optionally preceded by a short
-    preamble (returned as content), optionally split into several such objects. Not accepted: JSON
-    followed by more prose (an example or explanation, not a call). A '### TOOL RESULT' block the
-    model invented after its call is cut off before parsing."""
-    if not allowed or not text:
-        return ToolParse(None, text or "")
-    t = text.strip()
-    fake = FAKE_RESULT_RE.search(t)
-    if fake and "{" in t[:fake.start()]:
-        t = t[:fake.start()].rstrip()
+def _scan_envelopes(t: str) -> tuple[list[tuple[int, int, Any]], bool]:
+    """Top-level JSON objects in t that are tool-call envelopes, as (start, end, obj); plus a flag that
+    is True when something looked like a tool call but is not valid JSON."""
     spans: list[tuple[int, int, Any]] = []
     i, broken = 0, False
     while True:
@@ -989,15 +980,50 @@ def parse_tool_reply(text: str, allowed: set[str]) -> ToolParse:
         elif obj is None and ('"tool_calls"' in seg or '"name"' in seg):
             broken = True
         i = end
+    return spans, broken
+
+
+def parse_tool_reply(text: str, allowed: set[str]) -> ToolParse:
+    """Find emulated tool calls in a model reply.
+
+    Accepted: the reply is a tool-call JSON object, optionally fenced, optionally preceded by a short
+    preamble (returned as content), optionally split into several such objects. Not accepted: JSON
+    followed by more prose (an example or explanation, not a call). A '### TOOL RESULT' block the
+    model invented after its call is cut off before parsing."""
+    if not allowed or not text:
+        return ToolParse(None, text or "")
+    t = text.strip()
+    spans, broken = _scan_envelopes(t)
+    cut = False
+    for fake in FAKE_RESULT_RE.finditer(t):
+        # The model wrote a call and then invented its result (seen live, also on the same line as the
+        # JSON). Keep the call(s) before the first such marker and drop the rest.
+        head = [sp for sp in spans if sp[1] <= fake.start()]
+        if head:
+            log.info("dropped %d characters after an emulated tool call (invented tool result)",
+                     len(t) - fake.start())
+            t, spans, cut = t[:fake.start()].rstrip(), head, True
+            break
     if not spans:
         if broken:
             return ToolParse(None, text, "the tool-call JSON is invalid or incomplete")
         return ToolParse(None, text)
+    lead = FENCE_LINE_RE.sub("", t[:spans[0][0]]).strip()
     tail = FENCE_LINE_RE.sub("", t[spans[-1][1]:]).strip()
-    if tail:
-        return ToolParse(None, text)       # JSON followed by prose: an example, not a call
+    if tail and not cut:
+        if lead:
+            return ToolParse(None, text)   # JSON inside prose: an example, not a call
+        # The reply STARTS with a call and then keeps talking (answering before it has the results).
+        # Keep the leading call(s); the model answers again once the real results arrive.
+        keep = [spans[0]]
+        for sp in spans[1:]:
+            if FENCE_LINE_RE.sub("", t[keep[-1][1]:sp[0]]).strip():
+                break
+            keep.append(sp)
+        log.info("dropped %d characters of text after a leading emulated tool call", len(t) - keep[-1][1])
+        spans, t = keep, t[:keep[-1][1]]
     between = "".join(FENCE_LINE_RE.sub("", t[a[1]:b[0]]).strip() for a, b in zip(spans, spans[1:]))
-    if between:
+    if between and not cut:
         return ToolParse(None, text)
     preamble = FENCE_LINE_RE.sub("", t[:spans[0][0]]).strip()
     calls = []

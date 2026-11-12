@@ -2,6 +2,18 @@
 
 All notable changes are documented here. This project uses [Semantic Versioning](https://semver.org/).
 
+## 1.2.2 (2026-11-12)
+**Fixed**
+- Emulated tool calls: a model that wrote its call and then *invented* the tool result (`### TOOL RESULT …`)
+  on the same line, followed by an answer based on that invented result, got the whole reply shown as
+  plain text and no tool ran. Such markers are now recognised anywhere after a call; the call is kept and
+  the rest is dropped.
+- A reply that starts with a valid call but keeps talking afterwards (answering before it has the results)
+  is now treated as a call; the text after it is dropped, and the model answers once the real results
+  arrive. JSON inside prose (text before and after it) is still treated as an example.
+- The tool instruction no longer shows the result header as a template, and it says that everything after
+  the JSON is discarded. Dropped text is logged as a character count only.
+
 ## 1.2.1 (2026-11-11)
 **Fixed**
 - `reasoning_effort` values outside u:ai's `low` / `medium` / `high` no longer fail with 400. Agent
